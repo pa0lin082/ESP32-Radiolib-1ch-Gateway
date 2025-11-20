@@ -1,6 +1,6 @@
 # LoRaWAN Single Channel Gateway for ChirpStack
 
-Single-channel LoRaWAN gateway based on **Heltec WiFi LoRa 32 V4** (ESP32-S3 + SX1262) tested with **ChirpStack** via Semtech UDP protocol.
+Single-channel LoRaWAN gateway based on **Heltec WiFi LoRa 32 V4** (ESP32-S3 + SX1262) using Radiolib and tested with **ChirpStack** via Semtech UDP protocol.
 
 ## 🎯 Features
 
