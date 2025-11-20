@@ -1,0 +1,1349 @@
+/*
+ * LoRaWAN Single Channel Gateway for ChirpStack
+ * Hardware: Heltec WiFi LoRa 32 V4 (ESP32-S3 + SX1262)
+ * 
+ * Features:
+ * - RadioLib for SX1262 support
+ * - Semtech UDP protocol for ChirpStack
+ * - OLED display
+ * - WiFi connectivity
+ * - NTP time synchronization
+ */
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include <SPI.h>
+#include <Wire.h>
+#include <RadioLib.h>
+#include <ArduinoJson.h>
+#include <time.h>
+#include <ArduinoOTA.h>
+#include "config.h"
+#include "variant.h"
+
+// ===========================
+// OLED DISPLAY
+// ===========================
+#if DISPLAY_ENABLED
+#include <U8g2lib.h>
+// SSD1306/SSD1315 128x64 I2C display (Heltec V4 uses SSD1306)
+// Hardware I2C: pins are set with Wire.begin(), only reset is needed
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C display(U8G2_R0, /* reset=*/ RESET_OLED);
+#endif
+
+// ===========================
+// RADIO CONFIGURATION
+// ===========================
+SPIClass loraSPI(HSPI);
+SX1262 radio = new Module(LORA_CS, LORA_DIO1, LORA_RESET, LORA_DIO2, loraSPI);
+
+// ===========================
+// NETWORK CONFIGURATION
+// ===========================
+WiFiUDP udpClient;
+IPAddress serverIP;
+
+const char* version = "1.0.0";
+
+// ===========================
+// GATEWAY STATE
+// ===========================
+uint64_t gatewayId = 0;
+uint32_t packetsReceived = 0;
+uint32_t packetsForwarded = 0;
+unsigned long lastDisplayUpdate = 0;
+unsigned long lastNtpUpdate = 0;
+unsigned long lastPullData = 0;
+bool radioInitialized = false;
+
+// Interrupt flag for packet reception
+volatile bool packetReceived = false;
+
+// Debug counters
+uint32_t totalInterrupts = 0;
+uint32_t crcErrors = 0;
+uint32_t timeouts = 0;
+uint32_t otherErrors = 0;
+
+// Downlink queue
+struct DownlinkMessage {
+    uint32_t tmst;      // Timestamp per trasmissione (già corretto da ChirpStack)
+    float freq;         // Frequenza
+    uint8_t rfch;       // RF chain
+    float powe;         // Potenza TX
+    String modu;        // Modulazione
+    String datr;        // Data rate
+    String codr;        // Coding rate
+    bool ipol;          // Inversione polarità
+    uint16_t prea;      // Preamble
+    uint8_t size;       // Dimensione payload
+    uint8_t data[256];  // Payload
+    bool imme;          // Trasmissione immediata
+    bool valid;         // Messaggio valido
+    uint32_t rxStoppedAt; // Quando abbiamo fermato RX
+    uint16_t token;     // Token per TX_ACK
+};
+
+// Coda downlink (fino a 4 messaggi in attesa)
+#define DOWNLINK_QUEUE_SIZE 4
+DownlinkMessage downlinkQueue[DOWNLINK_QUEUE_SIZE];
+volatile uint8_t downlinkQueueCount = 0;
+
+// Timing constants
+#define TX_START_DELAY_MS 100  // Ferma RX 100ms prima della TX per prepararsi
+
+// ===========================
+// INTERRUPT SERVICE ROUTINE
+// ===========================
+void IRAM_ATTR setPacketReceivedFlag() {
+    packetReceived = true;
+}
+
+// ===========================
+// STATISTICS
+// ===========================
+struct Statistics {
+    uint32_t rx_received;
+    uint32_t rx_ok;
+    uint32_t rx_fw;
+    uint32_t rx_bad;
+    uint32_t tx_received;
+    uint32_t tx_emitted;
+} stats = {0};
+
+// ===========================
+// FUNCTION DECLARATIONS
+// ===========================
+void initDisplay();
+void updateDisplay();
+void initWiFi();
+void initOTA();
+void initLoRa();
+void initNTP();
+void generateGatewayId();
+void sendUdpPacket(const char* jsonData);
+void handleLoRaPacket();
+void sendStatPacket();
+void sendPullData();
+void checkDownlinkMessages();
+bool parseDownlinkMessage(uint8_t* buffer, size_t length, uint16_t token);
+bool addDownlinkToQueue(DownlinkMessage* downlink);
+DownlinkMessage* getNextDownlink();
+void removeDownlinkFromQueue(uint8_t index);
+void transmitDownlink(DownlinkMessage* downlink);
+void sendTxAck(uint16_t token, bool success);
+String encodeBase64(uint8_t* data, size_t length);
+size_t decodeBase64(const char* input, uint8_t* output, size_t maxLength);
+
+// ===========================
+// SETUP
+// ===========================
+void setup() {
+    // Initialize USB Serial
+    Serial.begin(115200);
+    
+    // Wait for USB CDC connection (max 3 seconds)
+    for(int i=0; i<30 && !Serial; i++) {
+        delay(100);
+    }
+    
+    Serial.println("\n\n===================================");
+    Serial.println("LoRaWAN Gateway for ChirpStack");
+    Serial.println("Hardware: Heltec WiFi LoRa 32 V4");
+    Serial.println("Version: " + String(version));
+    Serial.println("===================================\n");
+
+    // Initialize LED
+    pinMode(LED_PIN, OUTPUT);
+    digitalWrite(LED_PIN, LOW);  // LED on
+    
+    // Initialize OLED display
+    #if DISPLAY_ENABLED
+    initDisplay();
+    #endif
+    
+    // Initialize WiFi
+    initWiFi();
+    
+    // Initialize OTA
+    initOTA();
+    
+    // Initialize NTP
+    initNTP();
+    
+    // Generate Gateway ID from MAC
+    generateGatewayId();
+    
+    // Initialize LoRa radio
+    initLoRa();
+    
+    digitalWrite(LED_PIN, HIGH);  // LED off
+    
+    Serial.println("\n===================================");
+    Serial.println("Gateway ready!");
+    Serial.println("===================================\n");
+}
+
+// ===========================
+// MAIN LOOP
+// ===========================
+void loop() {
+    // Handle OTA updates
+    ArduinoOTA.handle();
+    
+    // Handle incoming LoRa packets only when interrupt flag is set
+    if (radioInitialized && packetReceived) {
+        handleLoRaPacket();
+    }
+    
+    // Check for downlink messages from server
+    checkDownlinkMessages();
+    
+    // Transmit pending downlink dalla coda SOLO se è il momento giusto (non-bloccante)
+    if (radioInitialized && downlinkQueueCount > 0) {
+        DownlinkMessage* nextDownlink = getNextDownlink();
+        
+        if (nextDownlink && nextDownlink->valid) {
+            uint32_t current_tmst = micros();
+            
+            if (nextDownlink->imme) {
+                // Trasmissione immediata - fai subito
+                Serial.println("[DOWNLINK] Immediate transmission requested");
+                transmitDownlink(nextDownlink);
+                removeDownlinkFromQueue(0);  // Rimuovi dalla coda
+            } else {
+                // Trasmissione schedulata - controlla timing
+                int32_t time_until_tx = (int32_t)(nextDownlink->tmst - current_tmst);
+                
+                // Converti in millisecondi per leggibilità
+                int32_t ms_until_tx = time_until_tx / 1000;
+                
+                // Se mancano meno di TX_START_DELAY_MS, è ora di trasmettere
+                if (ms_until_tx <= TX_START_DELAY_MS && ms_until_tx >= -100) {
+                    transmitDownlink(nextDownlink);
+                    removeDownlinkFromQueue(0);  // Rimuovi dalla coda
+                } else if (ms_until_tx < -100) {
+                    // Troppo tardi! Scarta il downlink
+                    Serial.printf("[DOWNLINK] ⚠️ Too late! Missed target by %ld ms - discarding\n", -ms_until_tx);
+                    removeDownlinkFromQueue(0);  // Rimuovi dalla coda
+                }
+                // Altrimenti continua a fare altre cose e controlla al prossimo loop
+            }
+        }
+    }
+    
+    // Send PULL_DATA every 5 seconds to keep connection alive
+    if (WiFi.isConnected() && millis() - lastPullData > 5000) {
+        sendPullData();
+        lastPullData = millis();
+    }
+    
+    // Update display periodically
+    #if DISPLAY_ENABLED
+    if (millis() - lastDisplayUpdate > DISPLAY_UPDATE_INTERVAL) {
+        updateDisplay();
+        lastDisplayUpdate = millis();
+    }
+    #endif
+    
+    // Update NTP periodically
+    if (millis() - lastNtpUpdate > NTP_UPDATE_INTERVAL) {
+        initNTP();
+        lastNtpUpdate = millis();
+    }
+    
+    // Send statistics every 300 seconds
+    static unsigned long lastStatTime = 0;
+    if (millis() - lastStatTime > 300000) {
+        sendStatPacket();
+        lastStatTime = millis();
+    }
+    
+    // Debug: mostra se ci sono downlink in attesa (ogni secondo)
+    static unsigned long lastDownlinkCheck = 0;
+    if (downlinkQueueCount > 0 && millis() - lastDownlinkCheck > 1000) {
+        DownlinkMessage* nextDownlink = getNextDownlink();
+        if (nextDownlink && nextDownlink->valid) {
+            uint32_t current_tmst = micros();
+            int32_t ms_until_tx = ((int32_t)(nextDownlink->tmst - current_tmst)) / 1000;
+            Serial.printf("[DOWNLINK] ⏳ Queue: %d msg(s), next TX in %ld ms (still receiving!)\n", 
+                         downlinkQueueCount, ms_until_tx);
+        }
+        lastDownlinkCheck = millis();
+    }
+    
+    // Debug: stampa statistiche ogni 10 secondi
+    static unsigned long lastDebugTime = 0;
+    if (millis() - lastDebugTime > 10000) {
+        Serial.println("\n[STATS] ===== GATEWAY STATUS =====");
+        Serial.printf("[STATS] Uptime: %lu s\n", millis() / 1000);
+        Serial.printf("[STATS] Interrupt totali: %lu\n", totalInterrupts);
+        Serial.printf("[STATS] Pacchetti RX OK: %lu\n", stats.rx_ok);
+        Serial.printf("[STATS] Pacchetti TX: %lu (ricevuti: %lu)\n", stats.tx_emitted, stats.tx_received);
+        Serial.printf("[STATS] Errori CRC: %lu\n", crcErrors);
+        Serial.printf("[STATS] Timeout: %lu\n", timeouts);
+        Serial.printf("[STATS] Altri errori: %lu\n", otherErrors);
+        Serial.printf("[STATS] Radio in ascolto: %s\n", radioInitialized ? "SI" : "NO");
+        Serial.printf("[STATS] WiFi: %s\n", WiFi.isConnected() ? "OK" : "DISCONNESSO");
+        Serial.printf("[STATS] Downlink in coda: %d\n", downlinkQueueCount);
+        Serial.println("[STATS] ===============================\n");
+        lastDebugTime = millis();
+    }
+    
+    // Small delay to prevent watchdog issues
+    delay(1);
+}
+
+// ===========================
+// DISPLAY FUNCTIONS
+// ===========================
+void initDisplay() {
+    #if DISPLAY_ENABLED
+    // Enable power to OLED display (active LOW)
+    pinMode(VEXT_ENABLE, OUTPUT);
+    digitalWrite(VEXT_ENABLE, LOW);
+    delay(100); // Give the display time to power up
+    
+    // Initialize I2C for display
+    Wire.begin(I2C_SDA, I2C_SCL);
+    
+    display.begin();
+    display.clearBuffer();
+    display.setFont(u8g2_font_6x10_tr);
+    display.drawStr(0, 10, "LoRaWAN Gateway");
+    display.drawStr(0, 25, "Initializing...");
+    display.sendBuffer();
+    
+    Serial.println("[DISPLAY] Initialized");
+    #endif
+}
+
+void updateDisplay() {
+    #if DISPLAY_ENABLED
+    display.clearBuffer();
+    display.setFont(u8g2_font_6x10_tr);
+    
+    // Title
+    display.drawStr(0, 10, "LoRaWAN Gateway");
+    
+    // WiFi status
+    char line[32];
+    snprintf(line, sizeof(line), "WiFi: %s", WiFi.isConnected() ? "OK" : "DISC");
+    display.drawStr(0, 22, line);
+    
+    // Frequency and SF
+    snprintf(line, sizeof(line), "%.1fMHz SF%d", LORA_FREQUENCY, LORA_SPREADING_FACTOR);
+    display.drawStr(0, 34, line);
+    
+    // Statistics - RX and TX
+    snprintf(line, sizeof(line), "RX:%lu TX:%lu", stats.rx_ok, stats.tx_emitted);
+    display.drawStr(0, 46, line);
+    
+    // Time
+    time_t now = time(nullptr);
+    struct tm* timeinfo = localtime(&now);
+    snprintf(line, sizeof(line), "%02d:%02d:%02d", 
+             timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec);
+    display.drawStr(0, 58, line);
+    
+    display.sendBuffer();
+    #endif
+}
+
+// ===========================
+// WIFI FUNCTIONS
+// ===========================
+void initWiFi() {
+    Serial.print("[WIFI] Connecting to ");
+    Serial.print(WIFI_SSID);
+    Serial.print("...");
+    
+    #if DISPLAY_ENABLED
+    display.clearBuffer();
+    display.drawStr(0, 10, "WiFi connecting...");
+    display.sendBuffer();
+    #endif
+    
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    
+    unsigned long startTime = millis();
+    while (WiFi.status() != WL_CONNECTED) {
+        if (millis() - startTime > WIFI_CONNECT_TIMEOUT) {
+            Serial.println("\n[WIFI] Connection timeout!");
+            #if DISPLAY_ENABLED
+            display.clearBuffer();
+            display.drawStr(0, 10, "WiFi FAILED!");
+            display.sendBuffer();
+            #endif
+            delay(5000);
+            ESP.restart();
+        }
+        delay(500);
+        Serial.print(".");
+    }
+    
+    Serial.println(" Connected!");
+    Serial.print("[WIFI] IP address: ");
+    Serial.println(WiFi.localIP());
+    Serial.print("[WIFI] MAC address: ");
+    Serial.println(WiFi.macAddress());
+    
+    // Resolve server hostname
+    if (WiFi.hostByName(SERVER_HOST, serverIP)) {
+        Serial.print("[SERVER] Resolved to: ");
+        Serial.println(serverIP);
+    } else {
+        Serial.println("[SERVER] ERROR: Could not resolve hostname");
+    }
+}
+
+// ===========================
+// OTA FUNCTIONS
+// ===========================
+void initOTA() {
+    Serial.println("[OTA] Initializing OTA...");
+    
+    // Imposta hostname per mDNS
+    ArduinoOTA.setHostname("esp32-gateway");
+    
+    // Imposta password (opzionale ma consigliata)
+    ArduinoOTA.setPassword("admin");
+    
+    // Callback quando inizia l'aggiornamento
+    ArduinoOTA.onStart([]() {
+        String type;
+        if (ArduinoOTA.getCommand() == U_FLASH) {
+            type = "sketch";
+        } else {  // U_SPIFFS
+            type = "filesystem";
+        }
+        
+        Serial.println("[OTA] Start updating " + type);
+        
+        #if DISPLAY_ENABLED
+        display.clearBuffer();
+        display.drawStr(0, 10, "OTA Update...");
+        display.drawStr(0, 25, type.c_str());
+        display.sendBuffer();
+        #endif
+        
+        // Ferma la radio durante l'aggiornamento
+        if (radioInitialized) {
+            radio.standby();
+        }
+    });
+    
+    // Callback durante l'aggiornamento (progresso)
+    ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+        unsigned int percent = (progress * 100) / total;
+        Serial.printf("[OTA] Progress: %u%%\r", percent);
+        
+        #if DISPLAY_ENABLED
+        if (percent % 10 == 0) {  // Aggiorna display ogni 10%
+            display.clearBuffer();
+            display.drawStr(0, 10, "OTA Update...");
+            char progressStr[32];
+            snprintf(progressStr, sizeof(progressStr), "Progress: %u%%", percent);
+            display.drawStr(0, 25, progressStr);
+            display.sendBuffer();
+        }
+        #endif
+    });
+    
+    // Callback quando l'aggiornamento è completato
+    ArduinoOTA.onEnd([]() {
+        Serial.println("\n[OTA] Update complete!");
+        
+        #if DISPLAY_ENABLED
+        display.clearBuffer();
+        display.drawStr(0, 10, "OTA Complete!");
+        display.drawStr(0, 25, "Rebooting...");
+        display.sendBuffer();
+        #endif
+        
+        delay(1000);
+    });
+    
+    // Callback in caso di errore
+    ArduinoOTA.onError([](ota_error_t error) {
+        Serial.printf("[OTA] Error[%u]: ", error);
+        if (error == OTA_AUTH_ERROR) {
+            Serial.println("Auth Failed");
+        } else if (error == OTA_BEGIN_ERROR) {
+            Serial.println("Begin Failed");
+        } else if (error == OTA_CONNECT_ERROR) {
+            Serial.println("Connect Failed");
+        } else if (error == OTA_RECEIVE_ERROR) {
+            Serial.println("Receive Failed");
+        } else if (error == OTA_END_ERROR) {
+            Serial.println("End Failed");
+        }
+        
+        #if DISPLAY_ENABLED
+        display.clearBuffer();
+        display.drawStr(0, 10, "OTA ERROR!");
+        display.sendBuffer();
+        #endif
+        
+        // Riavvia la radio
+        if (radioInitialized) {
+            radio.startReceive();
+        }
+    });
+    
+    ArduinoOTA.begin();
+    
+    Serial.println("[OTA] Ready!");
+    Serial.println("[OTA] Hostname: esp32-gateway.local");
+    Serial.print("[OTA] IP address: ");
+    Serial.println(WiFi.localIP());
+}
+
+// ===========================
+// NTP FUNCTIONS
+// ===========================
+void initNTP() {
+    Serial.print("[NTP] Synchronizing time...");
+    
+    configTime(0, 0, NTP_SERVER);
+    
+    time_t now = time(nullptr);
+    int retry = 0;
+    while (now < 8 * 3600 * 2 && retry < 15) {
+        delay(500);
+        Serial.print(".");
+        now = time(nullptr);
+        retry++;
+    }
+    
+    if (now > 8 * 3600 * 2) {
+        Serial.println(" OK");
+        struct tm timeinfo;
+        gmtime_r(&now, &timeinfo);
+        Serial.print("[NTP] Current time: ");
+        Serial.println(asctime(&timeinfo));
+    } else {
+        Serial.println(" FAILED");
+    }
+    
+    lastNtpUpdate = millis();
+}
+
+// ===========================
+// GATEWAY ID GENERATION
+// ===========================
+void generateGatewayId() {
+    uint8_t mac[6];
+    WiFi.macAddress(mac);
+    
+    // Gateway ID format: MAC with 0xFFFF inserted in middle
+    // Example: AA:BB:CC:DD:EE:FF -> AABBCCFFFFDDEEFF
+    gatewayId = ((uint64_t)mac[0] << 56) |
+                ((uint64_t)mac[1] << 48) |
+                ((uint64_t)mac[2] << 40) |
+                ((uint64_t)0xFF << 32) |
+                ((uint64_t)0xFF << 24) |
+                ((uint64_t)mac[3] << 16) |
+                ((uint64_t)mac[4] << 8) |
+                ((uint64_t)mac[5]);
+    
+    Serial.print("[GATEWAY] ID: ");
+    Serial.printf("%016llX\n", gatewayId);
+}
+
+// ===========================
+// LORA INITIALIZATION
+// ===========================
+void initLoRa() {
+    Serial.println("[LORA] Initializing SX1262...");
+    
+    #if DISPLAY_ENABLED
+    display.clearBuffer();
+    display.drawStr(0, 10, "LoRa init...");
+    display.sendBuffer();
+    #endif
+    
+    // Initialize SPI for LoRa
+    loraSPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
+    
+    // Initialize radio
+    int state = radio.begin(LORA_FREQUENCY, 
+                           LORA_BANDWIDTH, 
+                           LORA_SPREADING_FACTOR, 
+                           LORA_CODING_RATE, 
+                           LORA_SYNC_WORD, 
+                           LORA_OUTPUT_POWER, 
+                           LORA_PREAMBLE_LENGTH);
+    
+    if (state == RADIOLIB_ERR_NONE) {
+        Serial.println("[LORA] SX1262 initialized successfully!");
+        Serial.printf("[LORA] Frequency: %.1f MHz\n", LORA_FREQUENCY);
+        Serial.printf("[LORA] Bandwidth: %.1f kHz\n", LORA_BANDWIDTH);
+        Serial.printf("[LORA] Spreading Factor: %d\n", LORA_SPREADING_FACTOR);
+        Serial.printf("[LORA] Coding Rate: 4/%d\n", LORA_CODING_RATE);
+        Serial.printf("[LORA] Output Power: %d dBm\n", LORA_OUTPUT_POWER);
+        
+        radioInitialized = true;
+    } else {
+        Serial.print("[LORA] ERROR: Initialization failed, code: ");
+        Serial.println(state);
+        
+        #if DISPLAY_ENABLED
+        display.clearBuffer();
+        display.drawStr(0, 10, "LoRa FAILED!");
+        char errorStr[32];
+        snprintf(errorStr, sizeof(errorStr), "Error: %d", state);
+        display.drawStr(0, 22, errorStr);
+        display.sendBuffer();
+        #endif
+        
+        return;
+    }
+    
+    // Configure DIO2 as RF switch for Heltec V4
+    state = radio.setDio2AsRfSwitch(true);
+    if (state != RADIOLIB_ERR_NONE) {
+        Serial.print("[LORA] WARNING: setDio2AsRfSwitch failed, code: ");
+        Serial.println(state);
+    }
+    
+    // Set CRC
+    state = radio.setCRC(LORA_CRC);
+    if (state != RADIOLIB_ERR_NONE) {
+        Serial.print("[LORA] WARNING: setCRC failed, code: ");
+        Serial.println(state);
+    } else {
+        Serial.printf("[LORA] CRC: %s\n", LORA_CRC ? "ABILITATO" : "DISABILITATO");
+    }
+    
+    // Set interrupt action on DIO1
+    radio.setDio1Action(setPacketReceivedFlag);
+    Serial.println("[LORA] Interrupt configured on DIO1");
+    
+    state = radio.setCurrentLimit(140);
+    Serial.printf("[RadioLib] Current limit set to %f\n", 140);
+    Serial.printf("[RadioLib] Current limit set result %d\n", state);
+    
+    // Riepilogo configurazione
+    Serial.println("\n[LORA] ===== CONFIGURAZIONE RADIO =====");
+    Serial.printf("[LORA] Frequenza: %.3f MHz\n", LORA_FREQUENCY);
+    Serial.printf("[LORA] Bandwidth: %.1f kHz\n", LORA_BANDWIDTH);
+    Serial.printf("[LORA] Spreading Factor: %d\n", LORA_SPREADING_FACTOR);
+    Serial.printf("[LORA] Coding Rate: 4/%d\n", LORA_CODING_RATE);
+    Serial.printf("[LORA] Sync Word: 0x%02X\n", LORA_SYNC_WORD);
+    Serial.printf("[LORA] Preamble Length: %d\n", LORA_PREAMBLE_LENGTH);
+    Serial.printf("[LORA] Output Power: %d dBm\n", LORA_OUTPUT_POWER);
+    Serial.printf("[LORA] CRC: %s\n", LORA_CRC ? "SI" : "NO");
+    Serial.println("[LORA] ====================================\n");
+    
+    // Start receiving
+    state = radio.startReceive();
+    if (state == RADIOLIB_ERR_NONE) {
+        Serial.println("[LORA] ✅ Started receiving - In ascolto per pacchetti...\n");
+    } else {
+        Serial.print("[LORA] ❌ ERROR: startReceive failed, code: ");
+        Serial.println(state);
+        radioInitialized = false;
+    }
+}
+
+// ===========================
+// LORA PACKET HANDLING
+// ===========================
+void handleLoRaPacket() {
+    uint8_t rxBuffer[256];
+    
+    // Conta interrupt totali
+    totalInterrupts++;
+    
+    // Reset interrupt flag
+    packetReceived = false;
+    
+    Serial.printf("[DEBUG] Interrupt #%lu - Lettura dati radio...\n", totalInterrupts);
+    
+    // Check if packet available
+    int state = radio.readData(rxBuffer, sizeof(rxBuffer));
+    
+    Serial.printf("[DEBUG] readData() returned: %d\n", state);
+    
+    if (state == RADIOLIB_ERR_NONE) {
+        // Packet received successfully
+        digitalWrite(LED_PIN, LOW);  // LED on
+        
+        size_t packetLength = radio.getPacketLength();
+        float rssi = radio.getRSSI();
+        float snr = radio.getSNR();
+        
+        stats.rx_received++;
+        stats.rx_ok++;
+        
+        Serial.println("\n[RX] ===== PACKET RECEIVED =====");
+        Serial.printf("[RX] Length: %d bytes\n", packetLength);
+        Serial.printf("[RX] RSSI: %.2f dBm\n", rssi);
+        Serial.printf("[RX] SNR: %.2f dB\n", snr);
+        Serial.print("[RX] Data (HEX): ");
+        for (size_t i = 0; i < packetLength; i++) {
+            Serial.printf("%02X ", rxBuffer[i]);
+        }
+        Serial.println();
+        Serial.print("[RX] Data (ASCII): ");
+        for (size_t i = 0; i < packetLength; i++) {
+            if (rxBuffer[i] >= 32 && rxBuffer[i] <= 126) {
+                Serial.printf("%c", rxBuffer[i]);
+            } else {
+                Serial.print(".");
+            }
+        }
+        Serial.println();
+        
+        // Forward to ChirpStack
+        if (WiFi.isConnected()) {
+            // Create JSON packet
+            StaticJsonDocument<512> doc;
+            JsonArray rxpk_array = doc.createNestedArray("rxpk");
+            JsonObject rxpk = rxpk_array.createNestedObject();
+            
+            // Get current time in microseconds (hardware timer)
+            uint32_t tmst = micros();
+            
+            rxpk["tmst"] = tmst;
+            rxpk["freq"] = LORA_FREQUENCY;
+            rxpk["chan"] = 0;
+            rxpk["rfch"] = 0;
+            rxpk["stat"] = 1;
+            rxpk["modu"] = "LORA";
+            
+            char datr[16];
+            snprintf(datr, sizeof(datr), "SF%dBW%.0f", LORA_SPREADING_FACTOR, LORA_BANDWIDTH);
+            rxpk["datr"] = datr;
+            
+            char codr[8];
+            snprintf(codr, sizeof(codr), "4/%d", LORA_CODING_RATE);
+            rxpk["codr"] = codr;
+            
+            rxpk["rssi"] = (int)rssi;
+            rxpk["lsnr"] = snr;
+            rxpk["size"] = packetLength;
+            rxpk["data"] = encodeBase64(rxBuffer, packetLength);
+            
+            String jsonString;
+            serializeJson(doc, jsonString);
+            
+            Serial.println("[UDP] Forwarding to ChirpStack:");
+            Serial.println(jsonString);
+            
+            sendUdpPacket(jsonString.c_str());
+            stats.rx_fw++;
+            
+        } else {
+            Serial.println("[UDP] ERROR: WiFi disconnected, packet not forwarded");
+        }
+        
+        Serial.println("[RX] =============================\n");
+        
+        delay(100);
+        digitalWrite(LED_PIN, HIGH);  // LED off
+        
+        // Restart receiving
+        radio.startReceive();
+        
+    } else if (state == RADIOLIB_ERR_RX_TIMEOUT) {
+        // Timeout - nessun pacchetto ricevuto
+        timeouts++;
+        Serial.printf("[DEBUG] Timeout (totale: %lu) - Nessun pacchetto\n", timeouts);
+        radio.startReceive();
+    } else if (state == RADIOLIB_ERR_CRC_MISMATCH) {
+        // CRC ERROR - MA I DATI SONO ARRIVATI!
+        // Per LoRaWAN, accettiamo comunque (ha il suo MIC per verificare)
+        crcErrors++;
+        Serial.printf("[DEBUG] CRC ERROR (totale: %lu)\n", crcErrors);
+        // stats.rx_received++;
+        // stats.rx_ok++; // Contiamo come OK per LoRaWAN
+        
+        // digitalWrite(LED_PIN, LOW);  // LED on
+        
+        // size_t packetLength = radio.getPacketLength();
+        // float rssi = radio.getRSSI();
+        // float snr = radio.getSNR();
+        
+        // Serial.println("\n[RX] ===== PACKET RECEIVED (CRC ignored) =====");
+        // Serial.printf("[RX] Length: %d bytes\n", packetLength);
+        // Serial.printf("[RX] RSSI: %.2f dBm\n", rssi);
+        // Serial.printf("[RX] SNR: %.2f dB\n", snr);
+        // Serial.print("[RX] Data (HEX): ");
+        // for (size_t i = 0; i < packetLength; i++) {
+        //     Serial.printf("%02X ", rxBuffer[i]);
+        // }
+        // Serial.println();
+        // Serial.print("[RX] Data (ASCII): ");
+        // for (size_t i = 0; i < packetLength; i++) {
+        //     if (rxBuffer[i] >= 32 && rxBuffer[i] <= 126) {
+        //         Serial.printf("%c", rxBuffer[i]);
+        //     } else {
+        //         Serial.print(".");
+        //     }
+        // }
+        // Serial.println();
+        // Serial.printf("[RX] Note: CRC error (totale: %lu) ma dati validi\n", crcErrors);
+        
+        // // Forward to ChirpStack COMUNQUE
+        // if (WiFi.isConnected()) {
+        //     StaticJsonDocument<512> doc;
+        //     JsonArray rxpk_array = doc.createNestedArray("rxpk");
+        //     JsonObject rxpk = rxpk_array.createNestedObject();
+            
+        //     struct timeval tv;
+        //     gettimeofday(&tv, NULL);
+        //     uint32_t tmst = (uint32_t)(tv.tv_sec * 1000000 + tv.tv_usec);
+            
+        //     rxpk["tmst"] = tmst;
+        //     rxpk["freq"] = LORA_FREQUENCY;
+        //     rxpk["chan"] = 0;
+        //     rxpk["rfch"] = 0;
+        //     rxpk["stat"] = 1;
+        //     rxpk["modu"] = "LORA";
+            
+        //     char datr[16];
+        //     snprintf(datr, sizeof(datr), "SF%dBW%.0f", LORA_SPREADING_FACTOR, LORA_BANDWIDTH);
+        //     rxpk["datr"] = datr;
+            
+        //     char codr[8];
+        //     snprintf(codr, sizeof(codr), "4/%d", LORA_CODING_RATE);
+        //     rxpk["codr"] = codr;
+            
+        //     rxpk["rssi"] = (int)rssi;
+        //     rxpk["lsnr"] = snr;
+        //     rxpk["size"] = packetLength;
+        //     rxpk["data"] = encodeBase64(rxBuffer, packetLength);
+            
+        //     String jsonString;
+        //     serializeJson(doc, jsonString);
+            
+        //     Serial.println("[UDP] Forwarding to ChirpStack:");
+        //     Serial.println(jsonString);
+            
+        //     sendUdpPacket(jsonString.c_str());
+        //     stats.rx_fw++;
+        // }
+        
+        // Serial.println("[RX] =============================================\n");
+        
+        // delay(100);
+        // digitalWrite(LED_PIN, HIGH);  // LED off
+        
+        radio.startReceive();
+    } else {
+        // Altri errori
+        otherErrors++;
+        Serial.printf("\n[RX] ===== ERROR %d =====\n", state);
+        Serial.printf("[RX] Totale altri errori: %lu\n", otherErrors);
+        Serial.println("[RX] ======================\n");
+        radio.startReceive();
+    }
+}
+
+// ===========================
+// UDP FUNCTIONS
+// ===========================
+void sendUdpPacket(const char* jsonData) {
+    if (!WiFi.isConnected()) {
+        Serial.println("[UDP] ERROR: WiFi not connected");
+        return;
+    }
+    
+    udpClient.beginPacket(serverIP, SERVER_PORT);
+    
+    // Protocol version (always 0x02)
+    udpClient.write((uint8_t)0x02);
+    
+    // Random token
+    uint16_t token = random(0xFFFF);
+    udpClient.write((uint8_t)(token >> 8));
+    udpClient.write((uint8_t)(token & 0xFF));
+    
+    // Identifier: PUSH_DATA = 0x00
+    udpClient.write((uint8_t)0x00);
+    
+    // Gateway ID (8 bytes)
+    for (int i = 7; i >= 0; i--) {
+        udpClient.write((uint8_t)((gatewayId >> (i * 8)) & 0xFF));
+    }
+    
+    // JSON data
+    udpClient.print(jsonData);
+    
+    int result = udpClient.endPacket();
+    
+    if (result) {
+        Serial.println("[UDP] Packet sent successfully");
+    } else {
+        Serial.println("[UDP] ERROR: Failed to send packet");
+    }
+}
+
+void sendStatPacket() {
+    if (!WiFi.isConnected()) return;
+    
+    StaticJsonDocument<256> doc;
+    JsonObject stat = doc.createNestedObject("stat");
+    
+    // Get current time
+    time_t now = time(nullptr);
+    struct tm timeinfo;
+    gmtime_r(&now, &timeinfo);
+    char timestamp[32];
+    strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S GMT", &timeinfo);
+    
+    stat["time"] = timestamp;
+    stat["rxnb"] = stats.rx_received;
+    stat["rxok"] = stats.rx_ok;
+    stat["rxfw"] = stats.rx_fw;
+    stat["ackr"] = 100.0;
+    stat["dwnb"] = stats.tx_received;
+    stat["txnb"] = stats.tx_emitted;
+    
+    String jsonString;
+    serializeJson(doc, jsonString);
+    
+    Serial.println("[STAT] Sending statistics:");
+    Serial.println(jsonString);
+    
+    sendUdpPacket(jsonString.c_str());
+}
+
+// ===========================
+// DOWNLINK FUNCTIONS
+// ===========================
+void sendPullData() {
+    if (!WiFi.isConnected()) {
+        Serial.println("[PULL_DATA] ERROR: WiFi not connected");
+        return;
+    }
+    
+    udpClient.beginPacket(serverIP, SERVER_PORT);
+    
+    // Protocol version (always 0x02)
+    udpClient.write((uint8_t)0x02);
+    
+    // Random token
+    uint16_t token = random(0xFFFF);
+    udpClient.write((uint8_t)(token >> 8));
+    udpClient.write((uint8_t)(token & 0xFF));
+    
+    // Identifier: PULL_DATA = 0x02
+    udpClient.write((uint8_t)0x02);
+    
+    // Gateway ID (8 bytes)
+    for (int i = 7; i >= 0; i--) {
+        udpClient.write((uint8_t)((gatewayId >> (i * 8)) & 0xFF));
+    }
+    
+    int result = udpClient.endPacket();
+    
+    if (result) {
+        Serial.println("[PULL_DATA] Sent - gateway registered for downlink");
+    } else {
+        Serial.println("[PULL_DATA] ERROR: Failed to send");
+    }
+}
+
+void checkDownlinkMessages() {
+    int packetSize = udpClient.parsePacket();
+    if (packetSize > 0) {
+        uint8_t buffer[1024];
+        int len = udpClient.read(buffer, sizeof(buffer));
+        
+        if (len >= 4) {
+            uint8_t version = buffer[0];
+            uint16_t token = (buffer[1] << 8) | buffer[2];
+            uint8_t identifier = buffer[3];
+            
+            Serial.printf("[UDP] Received packet: version=%d, token=%04X, id=%d, len=%d\n", 
+                         version, token, identifier, len);
+            
+            // PULL_ACK (0x04)
+            if (identifier == 0x04) {
+                Serial.println("[PULL_ACK] Server acknowledged PULL_DATA");
+            }
+            // PULL_RESP (0x03) - Downlink message
+            else if (identifier == 0x03) {
+                Serial.println("[PULL_RESP] Downlink message received!");
+                stats.tx_received++;
+                
+                // Parse JSON payload (starts at byte 4)
+                if (parseDownlinkMessage(buffer + 4, len - 4, token)) {
+                    Serial.printf("[PULL_RESP] Downlink parsed and queued (queue: %d)\n", downlinkQueueCount);
+                    // TX_ACK sarà inviato dopo trasmissione
+                } else {
+                    Serial.println("[PULL_RESP] ERROR: Failed to parse downlink");
+                    sendTxAck(token, false);
+                }
+            }
+            // PUSH_ACK (0x01)
+            else if (identifier == 0x01) {
+                Serial.println("[PUSH_ACK] Server acknowledged uplink");
+            }
+        }
+    }
+}
+
+// ===========================
+// DOWNLINK QUEUE MANAGEMENT
+// ===========================
+bool addDownlinkToQueue(DownlinkMessage* downlink) {
+    if (downlinkQueueCount >= DOWNLINK_QUEUE_SIZE) {
+        Serial.println("[QUEUE] ERROR: Queue full!");
+        return false;
+    }
+    
+    // Copia il messaggio nella coda
+    memcpy(&downlinkQueue[downlinkQueueCount], downlink, sizeof(DownlinkMessage));
+    downlinkQueueCount++;
+    
+    Serial.printf("[QUEUE] Added downlink to queue (count: %d)\n", downlinkQueueCount);
+    return true;
+}
+
+DownlinkMessage* getNextDownlink() {
+    if (downlinkQueueCount == 0) {
+        return nullptr;
+    }
+    
+    // Ritorna il primo della coda (FIFO)
+    return &downlinkQueue[0];
+}
+
+void removeDownlinkFromQueue(uint8_t index) {
+    if (index >= downlinkQueueCount) {
+        return;
+    }
+    
+    // Shift tutti gli elementi dopo index
+    for (uint8_t i = index; i < downlinkQueueCount - 1; i++) {
+        memcpy(&downlinkQueue[i], &downlinkQueue[i + 1], sizeof(DownlinkMessage));
+    }
+    
+    downlinkQueueCount--;
+    Serial.printf("[QUEUE] Removed downlink (remaining: %d)\n", downlinkQueueCount);
+}
+
+bool parseDownlinkMessage(uint8_t* buffer, size_t length, uint16_t token) {
+    // Parse JSON
+    StaticJsonDocument<1024> doc;
+    DeserializationError error = deserializeJson(doc, buffer, length);
+    
+    if (error) {
+        Serial.print("[PARSE] JSON error: ");
+        Serial.println(error.c_str());
+        return false;
+    }
+    
+    // Check if txpk exists
+    if (!doc.containsKey("txpk")) {
+        Serial.println("[PARSE] ERROR: No txpk in message");
+        return false;
+    }
+    
+    JsonObject txpk = doc["txpk"];
+    
+    // Crea un nuovo messaggio downlink
+    DownlinkMessage newDownlink = {0};
+    
+    // Parse all fields
+    newDownlink.imme = txpk["imme"] | false;
+    newDownlink.tmst = txpk["tmst"] | 0;
+    newDownlink.freq = txpk["freq"] | LORA_FREQUENCY;
+    newDownlink.rfch = txpk["rfch"] | 0;
+    newDownlink.powe = txpk["powe"] | LORA_OUTPUT_POWER;
+    newDownlink.modu = txpk["modu"] | "LORA";
+    newDownlink.datr = txpk["datr"] | "SF7BW125";
+    newDownlink.codr = txpk["codr"] | "4/5";
+    newDownlink.ipol = txpk["ipol"] | true;  // LoRaWAN downlink usa polarità invertita
+    newDownlink.prea = txpk["prea"] | LORA_PREAMBLE_LENGTH;
+    newDownlink.size = txpk["size"] | 0;
+    newDownlink.token = token;
+    
+    // Decode base64 data
+    const char* data_b64 = txpk["data"];
+    if (data_b64) {
+        size_t decoded_len = decodeBase64(data_b64, newDownlink.data, sizeof(newDownlink.data));
+        newDownlink.size = decoded_len;
+        
+        Serial.println("[PARSE] Downlink details:");
+        Serial.printf("  imme: %s\n", newDownlink.imme ? "true" : "false");
+        Serial.printf("  tmst: %lu (current: %lu)\n", newDownlink.tmst, micros());
+        
+        // Calcola quanto manca alla trasmissione
+        int32_t delay_us = (int32_t)(newDownlink.tmst - micros());
+        Serial.printf("  time_until_tx: %ld ms\n", delay_us / 1000);
+        
+        Serial.printf("  freq: %.3f MHz\n", newDownlink.freq);
+        Serial.printf("  powe: %.1f dBm\n", newDownlink.powe);
+        Serial.printf("  datr: %s\n", newDownlink.datr.c_str());
+        Serial.printf("  codr: %s\n", newDownlink.codr.c_str());
+        Serial.printf("  ipol: %s\n", newDownlink.ipol ? "true" : "false");
+        Serial.printf("  size: %d bytes\n", newDownlink.size);
+        Serial.print("  data (HEX): ");
+        for (size_t i = 0; i < newDownlink.size; i++) {
+            Serial.printf("%02X ", newDownlink.data[i]);
+        }
+        Serial.println();
+        
+        newDownlink.valid = true;
+        
+        // Aggiungi alla coda
+        return addDownlinkToQueue(&newDownlink);
+    }
+    
+    Serial.println("[PARSE] ERROR: No data field");
+    return false;
+}
+
+void transmitDownlink(DownlinkMessage* downlink) {
+    if (!downlink || !downlink->valid) return;
+    
+    uint32_t tx_start_time = micros();
+    Serial.println("\n[TX] ===== TRANSMITTING DOWNLINK =====");
+    
+    // Parse data rate (es. "SF7BW125")
+    int sf = LORA_SPREADING_FACTOR;
+    float bw = LORA_BANDWIDTH;
+    if (downlink->datr.startsWith("SF")) {
+        sf = downlink->datr.substring(2, downlink->datr.indexOf("BW")).toInt();
+        bw = downlink->datr.substring(downlink->datr.indexOf("BW") + 2).toFloat();
+    }
+    
+    // Parse coding rate (es. "4/5")
+    int cr = LORA_CODING_RATE;
+    if (downlink->codr.length() >= 3) {
+        cr = downlink->codr.substring(2).toInt();
+    }
+    
+    Serial.printf("[TX] Config: SF%d BW%.0f CR4/%d Freq:%.3f Pwr:%.0f\n", 
+                  sf, bw, cr, downlink->freq, downlink->powe);
+    
+    // Stop receiving
+    int state = radio.standby();
+    if (state != RADIOLIB_ERR_NONE) {
+        Serial.printf("[TX] ERROR: standby failed: %d\n", state);
+    }
+    
+    // Cambia SOLO i parametri necessari (molto più veloce di begin!)
+    
+    // Frequenza (se diversa da RX)
+    if (downlink->freq != LORA_FREQUENCY) {
+      Serial.printf("[TX] Change Setting frequency to %.3f MHz\n", downlink->freq);
+        state = radio.setFrequency(downlink->freq);
+        if (state != RADIOLIB_ERR_NONE) {
+            Serial.printf("[TX] ERROR: setFrequency failed: %d\n", state);
+            sendTxAck(downlink->token, false);
+            radio.startReceive();  // Torna in RX
+            return;
+        }
+    }
+    
+    // Spreading Factor (se diverso da RX)
+    if (sf != LORA_SPREADING_FACTOR) {
+        Serial.printf("[TX] Change Setting spreading factor to %d\n", sf);
+        state = radio.setSpreadingFactor(sf);
+        if (state != RADIOLIB_ERR_NONE) {
+            Serial.printf("[TX] ERROR: setSpreadingFactor failed: %d\n", state);
+        }
+    }
+    
+    // Bandwidth (se diversa da RX)
+    if (bw != LORA_BANDWIDTH) {
+        Serial.printf("[TX] Change Setting bandwidth to %.0f kHz\n", bw);
+        state = radio.setBandwidth(bw);
+        if (state != RADIOLIB_ERR_NONE) {
+            Serial.printf("[TX] ERROR: setBandwidth failed: %d\n", state);
+        }
+    }
+    
+    // Coding Rate (se diverso da RX)
+    if (cr != LORA_CODING_RATE) {
+        Serial.printf("[TX] Change Setting coding rate to %d\n", cr);
+        state = radio.setCodingRate(cr);
+        if (state != RADIOLIB_ERR_NONE) {
+            Serial.printf("[TX] ERROR: setCodingRate failed: %d\n", state);
+        }
+    }
+    
+    // Potenza (se diversa da RX)
+    if (downlink->powe != LORA_OUTPUT_POWER) {
+        Serial.printf("[TX] Change Setting output power to %.1f dBm\n", downlink->powe);
+        state = radio.setOutputPower(downlink->powe);
+        if (state != RADIOLIB_ERR_NONE) {
+            Serial.printf("[TX] ERROR: setOutputPower failed: %d\n", state);
+        }
+    }
+
+    // Inversione IQ (SEMPRE necessaria per downlink LoRaWAN!)
+    Serial.printf("[TX] Change Setting invert IQ to %s\n", downlink->ipol ? "true" : "false");
+    state = radio.invertIQ(downlink->ipol);
+    if (state != RADIOLIB_ERR_NONE) {
+        Serial.printf("[TX] ERROR: invertIQ failed: %d\n", state);
+    }
+    
+    // Fine-tune timing: attendi SOLO i microsecondi rimanenti
+    if (!downlink->imme && downlink->tmst > 0) {
+        uint32_t current_tmst = micros();
+        int32_t delay_us = (int32_t)(downlink->tmst - current_tmst);
+        
+        if (delay_us > 0 && delay_us < 100000) {  // Max 100ms di attesa finale
+            Serial.printf("[TX] Fine-tuning: waiting %ld us\n", delay_us);
+            delayMicroseconds(delay_us);
+        } else if (delay_us < 0) {
+            Serial.printf("[TX] ⚠️ Late by %ld us\n", -delay_us);
+        } else if (delay_us >= 100000) {
+            Serial.printf("[TX] ⚠️ Too early! Still %ld ms to go\n", delay_us / 1000);
+        }
+    }
+    
+    // Transmit (BLOCCANTE - ma inevitabile, dura ~50-200ms a seconda SF)
+    uint32_t actual_tx_time = micros();
+    Serial.printf("[TX] Transmitting %d bytes at tmst=%lu...\n", downlink->size, actual_tx_time);
+    
+    state = radio.transmit(downlink->data, downlink->size);
+    
+    uint32_t tx_duration = micros() - actual_tx_time;
+    
+    bool success = (state == RADIOLIB_ERR_NONE);
+    
+    if (success) {
+        Serial.printf("[TX] ✅ SUCCESS! Duration: %lu ms\n", tx_duration / 1000);
+        stats.tx_emitted++;
+        
+        // LED flash veloce
+        digitalWrite(LED_PIN, LOW);
+        delay(50);
+        digitalWrite(LED_PIN, HIGH);
+    } else {
+        Serial.printf("[TX] ❌ ERROR: %d\n", state);
+    }
+    
+    // Send TX_ACK al server
+    sendTxAck(downlink->token, success);
+    
+    // Ripristina parametri RX (solo quelli cambiati!)
+    Serial.println("[TX] Restoring RX parameters...");
+    
+    if (downlink->freq != LORA_FREQUENCY) {
+        radio.setFrequency(LORA_FREQUENCY);
+    }
+    if (sf != LORA_SPREADING_FACTOR) {
+        radio.setSpreadingFactor(LORA_SPREADING_FACTOR);
+    }
+    if (bw != LORA_BANDWIDTH) {
+        radio.setBandwidth(LORA_BANDWIDTH);
+    }
+    if (cr != LORA_CODING_RATE) {
+        radio.setCodingRate(LORA_CODING_RATE);
+    }
+    if (downlink->powe != LORA_OUTPUT_POWER) {
+        radio.setOutputPower(LORA_OUTPUT_POWER);
+    }
+    
+    // Ripristina IQ normale per RX
+    radio.invertIQ(false);
+    
+    // Torna in modalità RX
+    state = radio.startReceive();
+    if (state != RADIOLIB_ERR_NONE) {
+        Serial.printf("[TX] ERROR: startReceive failed: %d, trying full reset\n", state);
+        // Solo se fallisce, reinizializza tutto
+        initLoRa();
+    }
+    
+    uint32_t total_time = micros() - tx_start_time;
+    Serial.printf("[TX] Total downtime: %lu ms\n", total_time / 1000);
+    Serial.println("[TX] ===================================\n");
+}
+
+void sendTxAck(uint16_t token, bool success) {
+    if (!WiFi.isConnected()) return;
+    
+    StaticJsonDocument<256> doc;
+    JsonObject txpk_ack = doc.createNestedObject("txpk_ack");
+    txpk_ack["error"] = success ? "NONE" : "TOO_LATE";
+    
+    String jsonString;
+    serializeJson(doc, jsonString);
+    
+    udpClient.beginPacket(serverIP, SERVER_PORT);
+    
+    // Protocol version
+    udpClient.write((uint8_t)0x02);
+    
+    // Token (same as received)
+    udpClient.write((uint8_t)(token >> 8));
+    udpClient.write((uint8_t)(token & 0xFF));
+    
+    // Identifier: TX_ACK = 0x05
+    udpClient.write((uint8_t)0x05);
+    
+    // JSON payload
+    udpClient.print(jsonString);
+    
+    udpClient.endPacket();
+    
+    Serial.printf("[TX_ACK] Sent: %s\n", jsonString.c_str());
+}
+
+// ===========================
+// BASE64 ENCODING/DECODING
+// ===========================
+String encodeBase64(uint8_t* data, size_t length) {
+    const char base64_chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    String result;
+    
+    for (size_t i = 0; i < length; i += 3) {
+        uint32_t b = (data[i] << 16) | ((i + 1 < length ? data[i + 1] : 0) << 8) | (i + 2 < length ? data[i + 2] : 0);
+        
+        result += base64_chars[(b >> 18) & 0x3F];
+        result += base64_chars[(b >> 12) & 0x3F];
+        result += (i + 1 < length) ? base64_chars[(b >> 6) & 0x3F] : '=';
+        result += (i + 2 < length) ? base64_chars[b & 0x3F] : '=';
+    }
+    
+    return result;
+}
+
+size_t decodeBase64(const char* input, uint8_t* output, size_t maxLength) {
+    const char base64_chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t input_len = strlen(input);
+    size_t output_len = 0;
+    uint32_t buffer = 0;
+    int bits = 0;
+    
+    for (size_t i = 0; i < input_len && output_len < maxLength; i++) {
+        char c = input[i];
+        
+        // Skip whitespace and padding
+        if (c == ' ' || c == '\n' || c == '\r' || c == '\t' || c == '=') {
+            continue;
+        }
+        
+        // Find character in base64 alphabet
+        const char* pos = strchr(base64_chars, c);
+        if (!pos) {
+            // Invalid character
+            continue;
+        }
+        
+        int value = pos - base64_chars;
+        buffer = (buffer << 6) | value;
+        bits += 6;
+        
+        if (bits >= 8) {
+            bits -= 8;
+            output[output_len++] = (buffer >> bits) & 0xFF;
+        }
+    }
+    
+    return output_len;
+}
+
+

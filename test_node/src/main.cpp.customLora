@@ -1,0 +1,406 @@
+/*
+ * LoRaWAN Test Node - ABP con RadioLib LoRaWAN
+ * 
+ * Questa versione usa RadioLib con supporto LoRaWAN VERO
+ * (con AES-CMAC per MIC e AES-128 per cifratura)
+ * 
+ * IMPORTANTE: Richiede RadioLib 6.6.0+
+ */
+
+#include <Arduino.h>
+#include <RadioLib.h>
+
+// ===========================
+// PINOUT - Heltec V4
+// ===========================
+#define LORA_SCK 9
+#define LORA_MISO 11
+#define LORA_MOSI 10
+#define LORA_CS 8
+#define LORA_RESET 12
+#define LORA_DIO1 14
+#define LORA_DIO2 13
+#define LED_PIN 35
+
+// ===========================
+// CONFIGURAZIONE LORA
+// ===========================
+#define LORA_FREQUENCY 868.1
+#define LORA_BANDWIDTH 125.0
+#define LORA_SPREADING_FACTOR 7
+#define LORA_CODING_RATE 5
+#define LORA_SYNC_WORD 0x34
+#define LORA_OUTPUT_POWER 17  // Minimo per test MOLTO ravvicinati (<1m) - riduce saturazione ricevitore
+#define LORA_PREAMBLE_LENGTH 8
+
+// ===========================
+// CHIAVI ABP (DA CONFIGURARE IN CHIRPSTACK)
+// ===========================
+// Device Address (4 bytes) - in formato little-endian per LoRaWAN
+uint32_t DevAddr = 0x260BDE80;
+
+// LoRaWAN 1.1 - Chiavi di Rete Separate
+// FNwkSIntKey - Forwarding Network session integrity key (16 bytes)
+uint8_t FNwkSIntKey[] = {
+    0x2B, 0x7E, 0x15, 0x16, 0x28, 0xAE, 0xD2, 0xA6,
+    0xAB, 0xF7, 0x15, 0x88, 0x09, 0xCF, 0x4F, 0x3C
+};
+
+// SNwkSIntKey - Serving Network session integrity key (16 bytes)
+uint8_t SNwkSIntKey[] = {
+    0x2B, 0x7E, 0x15, 0x16, 0x28, 0xAE, 0xD2, 0xA6,
+    0xAB, 0xF7, 0x15, 0x88, 0x09, 0xCF, 0x4F, 0x3C
+};
+
+// NwkSEncKey - Network session encryption key (16 bytes)
+uint8_t NwkSKey[] = {
+    0x2B, 0x7E, 0x15, 0x16, 0x28, 0xAE, 0xD2, 0xA6,
+    0xAB, 0xF7, 0x15, 0x88, 0x09, 0xCF, 0x4F, 0x3C
+};
+
+// Application Session Key (16 bytes)
+uint8_t AppSKey[] = {
+    0x2B, 0x7E, 0x15, 0x16, 0x28, 0xAE, 0xD2, 0xA6,
+    0xAB, 0xF7, 0x15, 0x88, 0x09, 0xCF, 0x4F, 0x3C
+};
+
+// ===========================
+// VARIABILI GLOBALI
+// ===========================
+SPIClass loraSPI(HSPI);
+SX1262 radio = new Module(LORA_CS, LORA_DIO1, LORA_RESET, LORA_DIO2, loraSPI);
+
+uint16_t frameCounter = 0;
+unsigned long lastTransmission = 0;
+const unsigned long TRANSMISSION_INTERVAL = 15000; // 15 secondi
+
+
+// ===========================
+// FUNZIONI LORAWAN
+// ===========================
+
+// Usa funzioni crypto di RadioLib (già implementate per LoRaWAN)
+// Queste sono le stesse usate internamente da LoRaWANNode
+
+// Cifra payload con AES-128 (AppSKey) - LoRaWAN encryption
+void encryptPayload(uint8_t* payload, uint8_t len, uint8_t* encPayload) {
+    // Copia il payload
+    memcpy(encPayload, payload, len);
+    
+    // Usa RadioLib AES
+    RadioLibAES128 aes;
+    aes.init(AppSKey);
+    
+    // LoRaWAN usa AES-128 in modalità counter
+    uint8_t A[16];
+    uint8_t S[16];
+    
+    uint8_t blocks = (len + 15) / 16;
+    
+    for (uint8_t i = 0; i < blocks; i++) {
+        // Costruisci il blocco A per counter mode
+        memset(A, 0, 16);
+        A[0] = 0x01;  // Encryption flag
+        A[5] = 0x00;  // Direction (0 = uplink)
+        A[6] = (DevAddr) & 0xFF;
+        A[7] = (DevAddr >> 8) & 0xFF;
+        A[8] = (DevAddr >> 16) & 0xFF;
+        A[9] = (DevAddr >> 24) & 0xFF;
+        A[10] = frameCounter & 0xFF;
+        A[11] = (frameCounter >> 8) & 0xFF;
+        A[15] = i + 1;
+        
+        // Cifra il blocco A per ottenere S
+        aes.encryptECB(S, 16, A);
+        
+        // XOR con il payload
+        for (uint8_t j = 0; j < 16 && (i * 16 + j) < len; j++) {
+            encPayload[i * 16 + j] ^= S[j];
+        }
+    }
+}
+
+// Calcola MIC (Message Integrity Code) con AES-CMAC
+void calculateMIC(uint8_t* msg, uint8_t len, uint8_t* mic) {
+    // Usa RadioLib AES-CMAC
+    // Per LoRaWAN 1.1 uplink: usa FNwkSIntKey
+    RadioLibAES128 aes;
+    aes.init(FNwkSIntKey);  // LoRaWAN 1.1 usa FNwkSIntKey per uplink MIC
+    
+    uint8_t fullMic[16];
+    // Parametri corretti: generateCMAC(input, length, output)
+    aes.generateCMAC(msg, (size_t)len, fullMic);
+    
+    // LoRaWAN usa solo i primi 4 bytes del MIC
+    memcpy(mic, fullMic, 4);
+}
+
+// Costruisce frame LoRaWAN completo
+uint8_t buildLoRaWANFrame(uint8_t* payload, uint8_t payloadLen, uint8_t* frame) {
+    uint8_t pos = 0;
+    
+    Serial.printf("[LoRaWAN] Costruzione frame - FCnt: %d, DevAddr: 0x%08X, PayloadLen: %d\n", 
+                  frameCounter, DevAddr, payloadLen);
+    
+    // MHDR (MAC Header) - 1 byte
+    // Unconfirmed Data Up (0x40)
+    frame[pos++] = 0x40;
+    
+    // DevAddr - 4 bytes (Little Endian)
+    frame[pos++] = (DevAddr) & 0xFF;
+    frame[pos++] = (DevAddr >> 8) & 0xFF;
+    frame[pos++] = (DevAddr >> 16) & 0xFF;
+    frame[pos++] = (DevAddr >> 24) & 0xFF;
+    
+    // FCtrl (Frame Control) - 1 byte
+    frame[pos++] = 0x00;  // No options
+    
+    // FCnt (Frame Counter) - 2 bytes (Little Endian)
+    frame[pos++] = frameCounter & 0xFF;
+    frame[pos++] = (frameCounter >> 8) & 0xFF;
+    
+    // FPort - 1 byte
+    frame[pos++] = 0x01;  // Application port 1
+    
+    // Payload cifrato
+    uint8_t encPayload[255];
+    encryptPayload(payload, payloadLen, encPayload);
+    memcpy(&frame[pos], encPayload, payloadLen);
+    pos += payloadLen;
+    
+    // Calcola MIC su tutto il frame (senza MIC)
+    // MIC include: MHDR | DevAddr | FCtrl | FCnt | FPort | EncPayload
+    // + B0 block per LoRaWAN
+    uint8_t micMsg[256];
+    uint8_t micPos = 0;
+    
+    // B0 block per MIC (16 bytes)
+    // Formato: 0x49 | 4*0x00 | Dir | DevAddr[4] | FCnt[4] | 0x00 | len
+    micMsg[micPos++] = 0x49;  // MIC flag
+    micMsg[micPos++] = 0x00;
+    micMsg[micPos++] = 0x00;
+    micMsg[micPos++] = 0x00;
+    micMsg[micPos++] = 0x00;
+    micMsg[micPos++] = 0x00;  // Direction (0 = uplink)
+    // DevAddr (4 bytes, little endian)
+    micMsg[micPos++] = (DevAddr) & 0xFF;
+    micMsg[micPos++] = (DevAddr >> 8) & 0xFF;
+    micMsg[micPos++] = (DevAddr >> 16) & 0xFF;
+    micMsg[micPos++] = (DevAddr >> 24) & 0xFF;
+    // FCnt (4 bytes, little endian) - IMPORTANTE: deve essere 4 bytes!
+    micMsg[micPos++] = frameCounter & 0xFF;
+    micMsg[micPos++] = (frameCounter >> 8) & 0xFF;
+    micMsg[micPos++] = 0x00;  // FCnt byte 2 (sempre 0 per frame counter a 16 bit)
+    micMsg[micPos++] = 0x00;  // FCnt byte 3 (sempre 0 per frame counter a 16 bit)
+    micMsg[micPos++] = 0x00;  // Padding
+    micMsg[micPos++] = pos;   // Lunghezza del messaggio (senza MIC)
+    
+    // Aggiungi il frame (senza MIC)
+    memcpy(&micMsg[micPos], frame, pos);
+    micPos += pos;
+    
+    // Calcola MIC
+    uint8_t mic[4];
+    calculateMIC(micMsg, micPos, mic);
+    
+    // Debug MIC
+    Serial.print("[LoRaWAN] MIC calcolato: ");
+    for (int i = 0; i < 4; i++) {
+        Serial.printf("%02X ", mic[i]);
+    }
+    Serial.println();
+    
+    // Aggiungi MIC al frame
+    memcpy(&frame[pos], mic, 4);
+    pos += 4;
+    
+    // Debug frame completo
+    Serial.print("[LoRaWAN] Frame completo (");
+    Serial.print(pos);
+    Serial.print(" bytes): ");
+    for (int i = 0; i < pos; i++) {
+        Serial.printf("%02X ", frame[i]);
+    }
+    Serial.println();
+    
+    return pos;  // Lunghezza totale frame
+}
+
+
+// ===========================
+// SETUP
+// ===========================
+void setup() {
+    Serial.begin(115200);
+    
+    // Attendi connessione seriale
+    for(int i=0; i<30 && !Serial; i++) {
+        delay(100);
+    }
+    
+    Serial.println("\n\n===================================");
+    Serial.println("LoRaWAN Test Node - ABP (RadioLib)");
+    Serial.println("===================================\n");
+    
+    // LED
+    pinMode(LED_PIN, OUTPUT);
+    digitalWrite(LED_PIN, HIGH); // LED off
+    
+    // Inizializza SPI
+    loraSPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
+    
+    // Inizializza radio
+    Serial.println("[LORA] Inizializzazione SX1262...");
+    int state = radio.begin(LORA_FREQUENCY, 
+                           LORA_BANDWIDTH, 
+                           LORA_SPREADING_FACTOR, 
+                           LORA_CODING_RATE, 
+                           LORA_SYNC_WORD, 
+                           LORA_OUTPUT_POWER, 
+                           LORA_PREAMBLE_LENGTH);
+    
+    if (state == RADIOLIB_ERR_NONE) {
+        Serial.println("[LORA] OK!");
+        Serial.printf("[LORA] Frequenza: %.1f MHz\n", LORA_FREQUENCY);
+        Serial.printf("[LORA] SF: %d\n", LORA_SPREADING_FACTOR);
+        Serial.printf("[LORA] BW: %.1f kHz\n", LORA_BANDWIDTH);
+    } else {
+        Serial.printf("[LORA] ERRORE: %d\n", state);
+        while(1) delay(1000);
+    }
+    
+    Serial.println("[LORA] OK!");
+    
+    // Configura DIO2 come RF switch
+    radio.setDio2AsRfSwitch(true);
+
+    state = radio.setCurrentLimit(140);
+    Serial.printf("[RadioLib] Current limit set to %d mA\n", 140);
+    Serial.printf("[RadioLib] Current limit set result %d\n", state);
+    
+    // IMPORTANTE: Abilita CRC per compatibilità con il gateway
+    state = radio.setCRC(true);
+    if (state != RADIOLIB_ERR_NONE) {
+        Serial.printf("[LORA] WARNING: setCRC failed, code: %d\n", state);
+    } else {
+        Serial.println("[LORA] CRC abilitato");
+    }
+    
+    // Riepilogo configurazione radio
+    Serial.println("\n[LORA] ===== CONFIGURAZIONE RADIO =====");
+    Serial.printf("[LORA] Frequenza: %.3f MHz\n", LORA_FREQUENCY);
+    Serial.printf("[LORA] Bandwidth: %.1f kHz\n", LORA_BANDWIDTH);
+    Serial.printf("[LORA] Spreading Factor: %d\n", LORA_SPREADING_FACTOR);
+    Serial.printf("[LORA] Coding Rate: 4/%d\n", LORA_CODING_RATE);
+    Serial.printf("[LORA] Sync Word: 0x%02X\n", LORA_SYNC_WORD);
+    Serial.printf("[LORA] Preamble Length: %d\n", LORA_PREAMBLE_LENGTH);
+    Serial.printf("[LORA] Output Power: %d dBm\n", LORA_OUTPUT_POWER);
+    Serial.printf("[LORA] CRC: ABILITATO\n");
+    Serial.println("[LORA] ====================================\n");
+    
+    Serial.println("\n[NODE] MODALITA' RAW - Trasmissione senza LoRaWAN stack");
+    Serial.println("[NODE] Nodo pronto! Invio RAW ogni 15 secondi...\n");
+    Serial.println("===================================\n");
+}
+
+
+int sendLoRaWANFrame(uint8_t* payload, uint8_t payloadLen) {
+    uint8_t frame[256];
+    uint8_t frameLen = buildLoRaWANFrame(payload, payloadLen, frame);
+    
+    Serial.printf("[TX] Invio frame LoRaWAN di %d bytes\n", frameLen);
+    
+    return radio.transmit(frame, frameLen);
+}
+
+// ===========================
+// LOOP
+// ===========================
+void loop() {
+    unsigned long now = millis();
+    
+    // Invia pacchetto ogni TRANSMISSION_INTERVAL
+    if (lastTransmission == 0 || now - lastTransmission >= TRANSMISSION_INTERVAL) {
+        lastTransmission = now;
+        
+        // Crea payload di test RAW (NON cifrato)
+        char payloadStr[50];
+        snprintf(payloadStr, sizeof(payloadStr), 
+                 "TEST RAW: %lu s", 
+                 now / 1000);
+        
+        uint8_t payloadLen = strlen(payloadStr);
+        
+        Serial.println("\n[TX] ===== INVIO PACCHETTO RAW =====");
+        Serial.printf("[TX] Payload (ASCII): %s\n", payloadStr);
+        Serial.printf("[TX] Lunghezza: %d bytes\n", payloadLen);
+        Serial.print("[TX] Payload (HEX): ");
+        for (int i = 0; i < payloadLen; i++) {
+            Serial.printf("%02X ", (uint8_t)payloadStr[i]);
+        }
+        Serial.println();
+
+
+
+        
+        // LED on
+        digitalWrite(LED_PIN, LOW);
+
+
+        
+        // // Invia usando RadioLib RAW (SENZA LoRaWAN)
+        // int state = radio.transmit((uint8_t*)payloadStr, payloadLen);
+        
+        // if (state == RADIOLIB_ERR_NONE) {
+        //     Serial.println("[TX] ✅ Pacchetto inviato con successo!");
+            
+        //     // Informazioni sulla trasmissione
+        //     float timeOnAir = radio.getTimeOnAir(payloadLen) / 1000.0;
+        //     Serial.printf("[TX] Time on air: %.2f ms\n", timeOnAir);
+            
+        //     // Verifica configurazione effettiva
+        //     Serial.printf("[TX] Frequenza usata: %.3f MHz\n", LORA_FREQUENCY);
+        //     Serial.printf("[TX] SF: %d, BW: %.1f kHz\n", LORA_SPREADING_FACTOR, LORA_BANDWIDTH);
+        // } else {
+        //     Serial.printf("[TX] ❌ ERRORE: %d\n", state);
+            
+        //     // Dettagli errore
+        //     if (state == RADIOLIB_ERR_TX_TIMEOUT) {
+        //         Serial.println("[TX] Timeout trasmissione!");
+        //     } else if (state == RADIOLIB_ERR_PACKET_TOO_LONG) {
+        //         Serial.println("[TX] Pacchetto troppo lungo!");
+        //     } else {
+        //         Serial.printf("[TX] Codice errore sconosciuto: %d\n", state);
+        //     }
+        // }
+
+        // Serial.println("[TX] ====================================\n");
+
+        // delay(1000);
+        int stateLoRaWAN = sendLoRaWANFrame((uint8_t*)payloadStr, payloadLen);
+        if (stateLoRaWAN == RADIOLIB_ERR_NONE) {
+          Serial.println("[TX] ✅ Pacchetto LoRaWAN inviato con successo!");
+          
+          // IMPORTANTE: Incrementa frame counter dopo invio riuscito
+          frameCounter++;
+          Serial.printf("[TX] Frame counter incrementato a: %d\n", frameCounter);
+          
+          // Informazioni sulla trasmissione
+          float timeOnAir = radio.getTimeOnAir(payloadLen) / 1000.0;
+          Serial.printf("[TX] Time on air: %.2f ms\n", timeOnAir);
+          
+          // Verifica configurazione effettiva
+          Serial.printf("[TX] Frequenza usata: %.3f MHz\n", LORA_FREQUENCY);
+          Serial.printf("[TX] SF: %d, BW: %.1f kHz\n", LORA_SPREADING_FACTOR, LORA_BANDWIDTH);
+        } else {
+            Serial.printf("[TX] ❌ ERRORE: %d\n", stateLoRaWAN);
+        }
+        
+        // LED off
+        delay(100);
+        digitalWrite(LED_PIN, HIGH);
+    }
+    
+    delay(100);
+}
+

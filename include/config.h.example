@@ -1,0 +1,133 @@
+// LoRaWAN Gateway Configuration
+#ifndef CONFIG_H
+#define CONFIG_H
+
+#define OTA_HOSTNAME "esp32-gateway"
+#define OTA_PASSWORD "admin"
+
+// ===========================
+// WIFI CONFIGURATION
+// ===========================
+#define WIFI_SSID "PodereDiPaglia"
+#define WIFI_PASSWORD "navighiamoNelBosco"
+
+// ===========================
+// CHIRPSTACK SERVER
+// ===========================
+#define SERVER_HOST "192.168.40.167"  // ChirpStack server IP
+#define SERVER_PORT 1700              // UDP port for Semtech protocol
+
+// ===========================
+// GATEWAY CONFIGURATION
+// ===========================
+// Gateway ID will be generated from MAC address
+// Format: MAC address with 0xFFFF inserted in the middle
+// Example: AA:BB:CC:DD:EE:FF -> AA:BB:CC:FF:FF:DD:EE:FF
+
+// ===========================
+// LORA CONFIGURATION
+// ===========================
+// Frequency in MHz
+#define LORA_FREQUENCY 868.1
+
+// Spreading Factor (7-12)
+#define LORA_SPREADING_FACTOR 7
+
+// Bandwidth in kHz (125, 250, 500)
+#define LORA_BANDWIDTH 125.0
+
+// Coding Rate (5-8 for 4/5 to 4/8)
+#define LORA_CODING_RATE 5
+
+// Output power in dBm (-9 to 22)
+// NOTA: Usa 2-5 dBm per test a corta distanza (<5m)
+//       Usa 14-20 dBm per distanze normali (>10m)
+//       Usa 20-22 dBm per massima portata (segnale debole)
+#define LORA_OUTPUT_POWER 22  // Massima potenza per compensare segnale debole
+
+// Preamble length
+#define LORA_PREAMBLE_LENGTH 8
+
+// Sync word (0x34 for public networks, 0x12 for private)
+#define LORA_SYNC_WORD 0x34
+
+// CRC enabled
+#define LORA_CRC true
+
+// ===========================
+// MULTI-FREQUENCY SUPPORT
+// ===========================
+// Enable to listen on multiple frequencies (SF7-SF12)
+#define MULTI_SF_ENABLED false
+
+// EU868 frequencies (in MHz)
+const float EU868_FREQS[] = {
+    868.1,  // Channel 0
+    868.3,  // Channel 1
+    868.5   // Channel 2
+};
+#define NUM_CHANNELS 3
+
+// ===========================
+// DEBUG SETTINGS
+// ===========================
+#define DEBUG_ENABLED true
+#define DEBUG_SERIAL Serial
+
+// ===========================
+// DISPLAY SETTINGS
+// ===========================
+#define DISPLAY_ENABLED true
+#define DISPLAY_UPDATE_INTERVAL 1000  // ms
+
+// ===========================
+// TIMEOUTS
+// ===========================
+#define WIFI_CONNECT_TIMEOUT 30000  // ms
+#define NTP_UPDATE_INTERVAL 3600000 // ms (1 hour)
+
+// ===========================
+// NTP CONFIGURATION
+// ===========================
+#define NTP_SERVER "pool.ntp.org"
+#define NTP_TIMEZONE "UTC-0"
+
+// ===========================
+// DOWNLINK CONFIGURATION
+// ===========================
+// Abilita risposta automatica "OK" ai nodi
+#define AUTO_DOWNLINK_ENABLED true
+
+// Timing finestre RX (in millisecondi)
+// NOTA: Il nodo apre RX1 a 905ms dalla sua prospettiva
+//       Ma il gateway riceve ~50ms dopo, quindi deve trasmettere a 855ms
+#define RX1_DELAY 1000   
+#define RX2_DELAY 2000   
+
+// ===========================
+// LORAWAN KEYS (per calcolo MIC downlink)
+// ===========================
+// NOTA: Queste chiavi DEVONO corrispondere al nodo!
+// Per più nodi, implementare un database DevAddr -> Chiavi
+// Per ora: supporto singolo nodo con DevAddr = 0x260BDE80
+
+// SNwkSIntKey - Serving Network session integrity key (16 bytes)
+// Usata per calcolare il MIC dei downlink LoRaWAN 1.1
+const uint8_t LORAWAN_SNWKSINTKEY[] = {
+    0x2B, 0x7E, 0x15, 0x16, 0x28, 0xAE, 0xD2, 0xA6,
+    0xAB, 0xF7, 0x15, 0x88, 0x09, 0xCF, 0x4F, 0x3C
+};
+
+// AppSKey - Application Session Key (16 bytes)
+// Usata per criptare/decriptare il payload applicativo
+const uint8_t LORAWAN_APPSKEY[] = {
+    0x2B, 0x7E, 0x15, 0x16, 0x28, 0xAE, 0xD2, 0xA6,
+    0xAB, 0xF7, 0x15, 0x88, 0x09, 0xCF, 0x4F, 0x3C
+};
+
+// DevAddr del nodo supportato (0 = accetta qualsiasi)
+#define LORAWAN_DEVADDR 0x260BDE80  // Imposta a 0 per accettare qualsiasi nodo
+
+#endif // CONFIG_H
+
+
