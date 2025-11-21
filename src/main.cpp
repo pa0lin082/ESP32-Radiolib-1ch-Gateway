@@ -642,19 +642,6 @@ void handleLoRaPacket() {
         }
         Serial.println();
         
-        // Estrai DevAddr dal pacchetto LoRaWAN (se è un uplink valido)
-        // Formato LoRaWAN uplink: MHDR(1) | DevAddr(4) | FCtrl(1) | FCnt(2) | ...
-        // uint32_t devAddr = 0;
-        // if (packetLength >= 7) {
-        //     // DevAddr è in little-endian ai byte 1-4
-        //     devAddr = ((uint32_t)rxBuffer[1]) | 
-        //     ((uint32_t)rxBuffer[2] << 8) | 
-        //     ((uint32_t)rxBuffer[3] << 16) | 
-        //     ((uint32_t)rxBuffer[4] << 24);
-        //     Serial.printf("[RX] DevAddr estratto: 0x%08X\n", devAddr);
-        // }
-
-
         PullRespPacket *pullRespPacket = nullptr;
         LoRaWANHeader lorawanHeader;
         memcpy(&lorawanHeader, rxBuffer, sizeof(LoRaWANHeader));
@@ -755,9 +742,7 @@ void handleLoRaPacket() {
         }
 
         
-        
         Serial.println("[RX] =============================\n");
-        
         digitalWrite(LED_PIN, HIGH);  // LED off
         
         // Invia risposta "OK" al nodo se abilitato
@@ -780,80 +765,6 @@ void handleLoRaPacket() {
         // Per LoRaWAN, accettiamo comunque (ha il suo MIC per verificare)
         crcErrors++;
         Serial.printf("[DEBUG] CRC ERROR (totale: %lu)\n", crcErrors);
-        // stats.rx_received++;
-        // stats.rx_ok++; // Contiamo come OK per LoRaWAN
-        
-        // digitalWrite(LED_PIN, LOW);  // LED on
-        
-        // size_t packetLength = radio.getPacketLength();
-        // float rssi = radio.getRSSI();
-        // float snr = radio.getSNR();
-        
-        // Serial.println("\n[RX] ===== PACKET RECEIVED (CRC ignored) =====");
-        // Serial.printf("[RX] Length: %d bytes\n", packetLength);
-        // Serial.printf("[RX] RSSI: %.2f dBm\n", rssi);
-        // Serial.printf("[RX] SNR: %.2f dB\n", snr);
-        // Serial.print("[RX] Data (HEX): ");
-        // for (size_t i = 0; i < packetLength; i++) {
-        //     Serial.printf("%02X ", rxBuffer[i]);
-        // }
-        // Serial.println();
-        // Serial.print("[RX] Data (ASCII): ");
-        // for (size_t i = 0; i < packetLength; i++) {
-        //     if (rxBuffer[i] >= 32 && rxBuffer[i] <= 126) {
-        //         Serial.printf("%c", rxBuffer[i]);
-        //     } else {
-        //         Serial.print(".");
-        //     }
-        // }
-        // Serial.println();
-        // Serial.printf("[RX] Note: CRC error (totale: %lu) ma dati validi\n", crcErrors);
-        
-        // // Forward to ChirpStack COMUNQUE
-        // if (WiFi.isConnected()) {
-        //     StaticJsonDocument<512> doc;
-        //     JsonArray rxpk_array = doc.createNestedArray("rxpk");
-        //     JsonObject rxpk = rxpk_array.createNestedObject();
-            
-        //     struct timeval tv;
-        //     gettimeofday(&tv, NULL);
-        //     uint32_t tmst = (uint32_t)(tv.tv_sec * 1000000 + tv.tv_usec);
-            
-        //     rxpk["tmst"] = tmst;
-        //     rxpk["freq"] = LORA_FREQUENCY;
-        //     rxpk["chan"] = 0;
-        //     rxpk["rfch"] = 0;
-        //     rxpk["stat"] = 1;
-        //     rxpk["modu"] = "LORA";
-            
-        //     char datr[16];
-        //     snprintf(datr, sizeof(datr), "SF%dBW%.0f", LORA_SPREADING_FACTOR, LORA_BANDWIDTH);
-        //     rxpk["datr"] = datr;
-            
-        //     char codr[8];
-        //     snprintf(codr, sizeof(codr), "4/%d", LORA_CODING_RATE);
-        //     rxpk["codr"] = codr;
-            
-        //     rxpk["rssi"] = (int)rssi;
-        //     rxpk["lsnr"] = snr;
-        //     rxpk["size"] = packetLength;
-        //     rxpk["data"] = encodeBase64(rxBuffer, packetLength);
-            
-        //     String jsonString;
-        //     serializeJson(doc, jsonString);
-            
-        //     Serial.println("[UDP] Forwarding to ChirpStack:");
-        //     Serial.println(jsonString);
-            
-        //     sendUdpPacket(jsonString.c_str());
-        //     stats.rx_fw++;
-        // }
-        
-        // Serial.println("[RX] =============================================\n");
-        
-        // delay(100);
-        // digitalWrite(LED_PIN, HIGH);  // LED off
-        
         radio.startReceive();
     } else {
         // Altri errori
@@ -986,17 +897,6 @@ void handleUdpDownlink() {
 
     SemtechUdpPackage packet;
     if (!packet.initFromBuffer(udpBuffer, len)) {
-    //   Serial.println("[SemtechUdpPackage] ✅ Packet parsed successfully!");
-    //   packet.printDebug();
-    //   Serial.println("DevAddr: " + String(packet.devAddr));
-    //   Serial.println("Token: " + String(packet.header.getToken()));
-    //   Serial.printf("getMessageType: 0x%02X\n", static_cast<uint8_t>(packet.header.getMessageType()));
-    //   Serial.println("getMessageTypeString: " + String(packet.header.getMessageTypeString()));
-    //   Serial.println("FPort: " + String(packet.fport));
-    //   Serial.println("MAC Command: " + String(packet.isMacCommand));
-    //   Serial.println("Payload size: " + String(packet.decodedLength));
-
-    // } else {
         Serial.println("[handleUdpDownlink] ❌ Errore parsing SemtechUdpPackage");
         return;
     }
@@ -1027,238 +927,6 @@ void handleUdpDownlink() {
         Serial.println("[handleUdpDownlink] getMessageTypeString: " + String(packet.getMessageTypeString()));
         packet.printDebug();
     }
-    
-    
-    //   Serial.println("[PULL] ✅ PULL_RESP ricevuto - downlink disponibile!");
-    //   Serial.println("[PULL] DevAddr: " + String(packet.devAddr));
-    //   packet.printDebug();
-    //   dowQueue.add(packet);
-    //   dowQueue.printDebug();
-    // }else{
-    //   Serial.println("[PULL] NO_HOPE");
-    //   return;
-    // }
-    
-    // uint8_t version = udpBuffer[0];
-    // uint16_t token = (udpBuffer[1] << 8) | udpBuffer[2];
-    // uint8_t identifier = udpBuffer[3];
-    
-    // Serial.printf("[UDP] Ricevuto pacchetto: ver=%d, token=%04X, id=%d, len=%d\n", 
-    //               version, token, identifier, len);
-    
-    // if (identifier == 0x03) {  // PULL_RESP = downlink disponibile!
-    //     Serial.println("[PULL] ✅ PULL_RESP ricevuto - downlink disponibile!");
-        
-    //     // Il payload JSON inizia dal byte 4
-    //     if (len > 4) {
-    //         // Parse JSON per estrarre il downlink
-    //         StaticJsonDocument<512> doc;
-    //         DeserializationError error = deserializeJson(doc, (char*)&udpBuffer[4], len - 4);
-            
-    //         if (error) {
-    //             Serial.printf("[PULL] ❌ Errore parsing JSON: %s\n", error.c_str());
-    //             Serial.print("[PULL] JSON raw: ");
-    //             for (int i = 4; i < len && i < 100; i++) {
-    //                 Serial.printf("%c", udpBuffer[i]);
-    //             }
-    //             Serial.println();
-    //         } else if (doc.containsKey("txpk")) {
-    //             JsonObject txpk = doc["txpk"];
-                
-    //             // DEBUG: Stampa tutti i campi del JSON per capire cosa invia ChirpStack
-    //             Serial.println("[PULL] 📋 Campi disponibili nel JSON txpk:");
-    //             for (JsonPair kv : txpk) {
-    //                 const char* key = kv.key().c_str();
-    //                 JsonVariant value = kv.value();
-    //                 if (value.is<bool>()) {
-    //                     Serial.printf("[PULL]   - %s: %s\n", key, value.as<bool>() ? "true" : "false");
-    //                 } else if (value.is<int>()) {
-    //                     Serial.printf("[PULL]   - %s: %d\n", key, value.as<int>());
-    //                 } else if (value.is<unsigned int>()) {
-    //                     Serial.printf("[PULL]   - %s: %u\n", key, value.as<unsigned int>());
-    //                 } else if (value.is<const char*>()) {
-    //                     Serial.printf("[PULL]   - %s: %s\n", key, value.as<const char*>());
-    //                 } else {
-    //                     Serial.printf("[PULL]   - %s: (altro tipo)\n", key);
-    //                 }
-    //             }
-                
-    //             // Estrai i dati del downlink
-    //             if (txpk.containsKey("data")) {
-    //                 const char* base64Data = txpk["data"];
-    //                 uint32_t tmst = txpk["tmst"] | 0;  // Timestamp (opzionale)
-    //                 bool imme = txpk["imme"] | false;  // Immediate transmission (Classe C)
-                    
-    //                 Serial.printf("[PULL] Downlink data (base64): %s\n", base64Data);
-    //                 Serial.printf("[PULL] Downlink tmst: %lu\n", tmst);
-    //                 Serial.printf("[PULL] ⚠️ Immediate (Classe C): %s\n", imme ? "SI ✅" : "NO ❌");
-                    
-    //                 if (!imme) {
-    //                     Serial.println("[PULL] ⚠️ ATTENZIONE: ChirpStack sta inviando questo messaggio come Classe A!");
-    //                     Serial.println("[PULL] Per abilitare Classe C, configura il device in ChirpStack:");
-    //                     Serial.println("[PULL]   1. Vai su Device → [Il tuo device]");
-    //                     Serial.println("[PULL]   2. Tab 'Configuration' o 'Device Profile'");
-    //                     Serial.println("[PULL]   3. Imposta 'Device Class' a 'C' (Class C)");
-    //                     Serial.println("[PULL]   4. Salva e riprova");
-    //                 }
-                    
-    //                 // Decodifica base64 in buffer temporaneo
-    //                 uint8_t tempBuffer[256];
-    //                 size_t decodedLen = decodeBase64(base64Data, tempBuffer, sizeof(tempBuffer));
-                    
-    //                 if (decodedLen > 0) {
-    //                     // Estrai DevAddr dal pacchetto LoRaWAN
-    //                     uint32_t devAddr = 0;
-    //                     bool isMacCommand = false;
-    //                     if (decodedLen >= 9) {
-    //                         // DevAddr è ai byte 1-4 (little-endian)
-    //                         devAddr = ((uint32_t)tempBuffer[1]) | 
-    //                                  ((uint32_t)tempBuffer[2] << 8) | 
-    //                                  ((uint32_t)tempBuffer[3] << 16) | 
-    //                                  ((uint32_t)tempBuffer[4] << 24);
-                            
-    //                         // Determina se è un comando MAC
-    //                         uint8_t fctrl = tempBuffer[5];
-    //                         uint8_t foptsLen = fctrl & 0x0F;
-    //                         size_t fportPos = 8 + foptsLen;
-    //                         if (fportPos < decodedLen - 4) {
-    //                             uint8_t fport = tempBuffer[fportPos];
-    //                             isMacCommand = (fport == 0);
-    //                         }
-    //                     }
-                        
-    //                     Serial.printf("[PULL] DevAddr destinatario: 0x%08X\n", devAddr);
-                        
-    //                     // Conta quanti messaggi ci sono già per questo DevAddr
-    //                     uint8_t countForDevAddr = 0;
-    //                     for (int i = 0; i < downlinkQueueCount; i++) {
-    //                         if (downlinkQueue[i].devAddr == devAddr && downlinkQueue[i].pending) {
-    //                             countForDevAddr++;
-    //                         }
-    //                     }
-                        
-    //                     // Se è Classe C (immediate), trasmette subito senza aggiungere alla coda
-    //                     if (imme) {
-    //                         Serial.println("[PULL] ⚡ CLASSE C: Trasmissione immediata!");
-                            
-    //                         // Trasmetti immediatamente
-    //                         if (radioInitialized) {
-    //                             digitalWrite(LED_PIN, LOW);
-    //                             radio.invertIQ(true);
-    //                             int state = radio.transmit(tempBuffer, decodedLen);
-    //                             radio.invertIQ(false);
-    //                             digitalWrite(LED_PIN, HIGH);
-                                
-    //                             if (state == RADIOLIB_ERR_NONE) {
-    //                                 Serial.println("[PULL] ✅ Classe C trasmesso con successo!");
-    //                                 sendTxAck(token);
-    //                                 stats.tx_emitted++;
-    //                                 justTransmitted = true;
-                                    
-    //                                 // Riavvia ricezione
-    //                                 radio.startReceive();
-    //                             } else {
-    //                                 Serial.printf("[PULL] ❌ Errore trasmissione Classe C: %d\n", state);
-    //                             }
-    //                         } else {
-    //                             Serial.println("[PULL] ❌ Radio non inizializzata, skip Classe C");
-    //                         }
-    //                     } else {
-    //                         // Classe A: aggiungi alla coda per trasmissione dopo uplink
-    //                         if (downlinkQueueCount < MAX_DOWNLINK_QUEUE_SIZE && 
-    //                             countForDevAddr < MAX_DOWNLINK_PER_DEVADDR) {
-    //                             PendingDownlink* dl = &downlinkQueue[downlinkQueueCount];
-    //                             dl->length = decodedLen;
-    //                             memcpy(dl->data, tempBuffer, decodedLen);
-    //                             dl->tmst = tmst;
-    //                             dl->token = token;
-    //                             dl->devAddr = devAddr;
-    //                             dl->pending = true;
-    //                             dl->isMacCommand = isMacCommand;
-    //                             dl->isClassC = false;
-                                
-    //                             downlinkQueueCount++;
-    //                             Serial.printf("[PULL] Messaggio Classe A aggiunto alla coda per DevAddr 0x%08X (%d/%d per questo nodo, %d/%d totale)\n", 
-    //                                          devAddr, countForDevAddr + 1, MAX_DOWNLINK_PER_DEVADDR, 
-    //                                          downlinkQueueCount, MAX_DOWNLINK_QUEUE_SIZE);
-    //                         } else {
-    //                             if (countForDevAddr >= MAX_DOWNLINK_PER_DEVADDR) {
-    //                                 Serial.printf("[PULL] ⚠️ Coda piena per DevAddr 0x%08X! (max %d messaggi per nodo)\n", 
-    //                                              devAddr, MAX_DOWNLINK_PER_DEVADDR);
-    //                             } else {
-    //                                 Serial.println("[PULL] ⚠️ Coda globale piena! Messaggio scartato.");
-    //                             }
-    //                         }
-    //                     }
-                        
-    //                     // Mantieni compatibilità con codice esistente
-    //                     pendingDownlink.length = decodedLen;
-    //                     memcpy(pendingDownlink.data, tempBuffer, decodedLen);
-    //                     pendingDownlink.tmst = tmst;
-    //                     pendingDownlink.token = token;
-    //                     pendingDownlink.devAddr = devAddr;
-    //                     pendingDownlink.pending = true;
-                        
-    //                     Serial.printf("[PULL] ✅ Downlink decodificato: %d bytes\n", pendingDownlink.length);
-    //                     Serial.printf("[PULL] Token salvato: 0x%04X (per TX_ACK)\n", token);
-    //                     Serial.print("[PULL] Downlink (HEX): ");
-    //                     for (size_t i = 0; i < pendingDownlink.length; i++) {
-    //                         Serial.printf("%02X ", pendingDownlink.data[i]);
-    //                     }
-    //                     Serial.println();
-                        
-    //                     // Decodifica pacchetto LoRaWAN per mostrare informazioni
-    //                     decodeLoRaWANPacket(pendingDownlink.data, pendingDownlink.length);
-                        
-    //                     // Verifica se è un comando MAC o payload applicativo
-    //                     // Il FPort si trova dopo: MHDR(1) + DevAddr(4) + FCtrl(1) + FCnt(2) + FOpts(variabile)
-    //                     if (pendingDownlink.length >= 9) {
-    //                         uint8_t fctrl = pendingDownlink.data[5];
-    //                         uint8_t foptsLen = fctrl & 0x0F;  // FOptsLen è nei primi 4 bit di FCtrl
-    //                         size_t fportPos = 8 + foptsLen;  // Posizione FPort dopo header + FOpts
-                            
-    //                         if (fportPos < pendingDownlink.length - 4) {  // -4 per MIC
-    //                             uint8_t fport = pendingDownlink.data[fportPos];
-    //                             if (fport == 0) {
-    //                                 Serial.println("[PULL] ⚠️ ATTENZIONE: Questo è un COMANDO MAC (FPort=0), non un payload applicativo!");
-    //                                 Serial.println("[PULL] IMPORTANTE: I comandi MAC DEVONO essere trasmessi per mantenere la sincronizzazione!");
-    //                                 Serial.println("[PULL] Se li ignori, il frame counter si desincronizza e i successivi messaggi avranno MIC errato.");
-    //                                 Serial.println("[PULL] ChirpStack sta dando priorità ai comandi MAC rispetto ai downlink dalla coda.");
-    //                                 Serial.println("[PULL] SOLUZIONE: In ChirpStack, vai su Device → MAC Settings e disabilita:");
-    //                                 Serial.println("[PULL]   - LinkCheckReq (se non necessario)");
-    //                                 Serial.println("[PULL]   - LinkADRReq (se non necessario)");
-    //                                 Serial.println("[PULL]   - DutyCycleReq (se non necessario)");
-    //                                 Serial.println("[PULL] Oppure aspetta che tutti i comandi MAC siano stati inviati.");
-    //                                 Serial.println("[PULL] ⚠️ Il comando MAC verrà comunque trasmesso per evitare desincronizzazione!");
-    //                             } else {
-    //                                 Serial.printf("[PULL] ✅ Questo è un PAYLOAD APPLICATIVO (FPort=%d) dalla coda!\n", fport);
-    //                             }
-    //                         }
-    //                     }
-                        
-    //                     Serial.println("[PULL] ⚠️ IMPORTANTE: Il downlink sarà trasmesso al prossimo uplink!");
-    //                 } else {
-    //                     Serial.println("[PULL] ❌ Errore decodifica base64");
-    //                 }
-    //             } else {
-    //                 Serial.println("[PULL] ⚠️ JSON txpk non contiene campo 'data'");
-    //             }
-    //         } else {
-    //             Serial.println("[PULL] ⚠️ JSON non contiene campo 'txpk'");
-    //             Serial.print("[PULL] JSON ricevuto: ");
-    //             serializeJson(doc, Serial);
-    //             Serial.println();
-    //         }
-    //     } else {
-    //         Serial.println("[PULL] ⚠️ PULL_RESP troppo corto (manca payload JSON)");
-    //     }
-    // }
-    // else if (identifier == 0x01) {  // PUSH_ACK
-    //     Serial.println("[UDP] PUSH_ACK ricevuto");
-    // }
-    // else if (identifier == 0x04) {  // PULL_ACK
-    //     Serial.println("[UDP] PULL_ACK ricevuto");
-    // }
 }
 
 
@@ -1553,25 +1221,6 @@ void sendDownlinkResponse(unsigned long rxTimestamp, PullRespPacket *pullRespPac
         radio.startReceive();
         return;
     }
-
-    // if (!pullRespPacket) {
-    //     Serial.println("[DOWNLINK] PULL_RESP non trovato");
-    //     return;
-    // }
-    
-    // ===== PRIORITÀ 1: Usa downlink da ChirpStack se disponibile =====
-    // Strategia: Cerca messaggi per questo DevAddr specifico
-    // Trasmetti fino a 2 messaggi per questo nodo - uno in RX1 e uno in RX2
-    // int messagesForDevAddr = 0;
-    // int indices[MAX_DOWNLINK_PER_DEVADDR];
-    
-    // // Cerca messaggi per questo DevAddr
-    // for (int i = 0; i < downlinkQueueCount && messagesForDevAddr < MAX_DOWNLINK_PER_DEVADDR; i++) {
-    //     if (downlinkQueue[i].pending && downlinkQueue[i].devAddr == devAddr) {
-    //         indices[messagesForDevAddr] = i;
-    //         messagesForDevAddr++;
-    //     }
-    // }
     
     if (pullRespPacket) {
         // Serial.printf("[DOWNLINK] ✅ %d messaggio/i in coda per DevAddr 0x%08X!\n", messagesForDevAddr, devAddr);
@@ -1590,59 +1239,9 @@ void sendDownlinkResponse(unsigned long rxTimestamp, PullRespPacket *pullRespPac
             sendTxAck(pullRespPacket->token);
 
             dowQueue.remove(pullRespPacket);
-            // // Rimuovi dalla coda (sposta gli elementi successivi)
-            // for (int i = indices[0]; i < downlinkQueueCount - 1; i++) {
-            //     downlinkQueue[i] = downlinkQueue[i + 1];
-            // }
-            // downlinkQueueCount--;
             
-            // Aggiorna gli indici dopo la rimozione
-            // if (messagesForDevAddr > 1 && indices[1] > indices[0]) {
-            //     indices[1]--;
-            // }
-            
-            // Se c'è un secondo messaggio per questo DevAddr, trasmettilo in RX2
-            // if (messagesForDevAddr > 1) {
-            //     PendingDownlink* dl2 = &downlinkQueue[indices[1]];
-            //     Serial.println("[DOWNLINK] 📤 Trasmissione messaggio 2 in RX2...");
-                
-            //     // Calcola tempo per RX2
-            //     unsigned long elapsed = getElapsedTime(rxTimestamp);
-            //     if (elapsed < RX2_DELAY) {
-            //         unsigned long waitTime = RX2_DELAY - elapsed;
-            //         delay(waitTime);
-                    
-            //         digitalWrite(LED_PIN, LOW);
-            //         radio.invertIQ(true);
-            //         int state = radio.transmit(dl2->data, dl2->length);
-            //         radio.invertIQ(false);
-            //         digitalWrite(LED_PIN, HIGH);
-                    
-            //         if (state == RADIOLIB_ERR_NONE) {
-            //             Serial.println("[DOWNLINK] ✅ Messaggio 2 trasmesso in RX2, invio TX_ACK");
-            //             sendTxAck(dl2->token);
-            //             stats.tx_emitted++;
-            //             justTransmitted = true;
-            //         } else {
-            //             Serial.printf("[DOWNLINK] ❌ Errore trasmissione messaggio 2: %d\n", state);
-            //         }
-            //     } else {
-            //         Serial.println("[DOWNLINK] ⚠️ RX2 già passata, messaggio 2 non trasmesso");
-            //     }
-                
-            //     // Rimuovi dalla coda
-            //     for (int i = indices[1]; i < downlinkQueueCount - 1; i++) {
-            //         downlinkQueue[i] = downlinkQueue[i + 1];
-            //     }
-            //     downlinkQueueCount--;
-            // }
         } else {
             Serial.println("[DOWNLINK] ❌ Trasmissione messaggio 1 fallita, NON invio TX_ACK");
-            // Rimuovi comunque dalla coda per evitare loop infiniti
-            // for (int i = indices[0]; i < downlinkQueueCount - 1; i++) {
-            //     downlinkQueue[i] = downlinkQueue[i + 1];
-            // }
-            // downlinkQueueCount--;
         }
         
         // Reset compatibilità
@@ -1650,124 +1249,6 @@ void sendDownlinkResponse(unsigned long rxTimestamp, PullRespPacket *pullRespPac
         return;
     }
     
-    // Compatibilità con codice esistente (legacy)
-    // Verifica che il DevAddr corrisponda prima di trasmettere
-    // if (pendingDownlink.pending) {
-    //     if (pendingDownlink.devAddr == devAddr) {
-    //         Serial.println("[DOWNLINK] ✅ Downlink da ChirpStack disponibile (legacy)!");
-            
-    //         uint16_t savedToken = pendingDownlink.token;
-    //         bool txSuccess = transmitDownlink(pendingDownlink.data, pendingDownlink.length, rxTimestamp);
-            
-    //         if (txSuccess) {
-    //             Serial.println("[DOWNLINK] ✅ Trasmissione riuscita, invio TX_ACK a ChirpStack");
-    //             sendTxAck(savedToken);
-    //         } else {
-    //             Serial.println("[DOWNLINK] ❌ Trasmissione fallita, NON invio TX_ACK");
-    //         }
-            
-    //         pendingDownlink.pending = false;
-    //         return;
-    //     } else {
-    //         Serial.printf("[DOWNLINK] ⚠️ Downlink legacy per DevAddr 0x%08X, ma uplink da 0x%08X - ignorato\n", 
-    //                      pendingDownlink.devAddr, devAddr);
-    //         pendingDownlink.pending = false;
-    //         return;
-    //     }
-    // }
-    
-    // ===== PRIORITÀ 2: Genera downlink locale (fallback) =====
-    // Serial.println("[DOWNLINK] Nessun downlink da ChirpStack, genero ACK locale");
-    
-    // // Verifica se il DevAddr è supportato
-    // #if LORAWAN_DEVADDR != 0
-    // if (devAddr != LORAWAN_DEVADDR) {
-    //     Serial.printf("[DOWNLINK] DevAddr 0x%08X non supportato, skip downlink\n", devAddr);
-    //     radio.startReceive();
-    //     return;
-    // }
-    // #endif
-    
-    // Serial.printf("[DOWNLINK] DevAddr 0x%08X riconosciuto\n", devAddr);
-    
-    // // Chiavi LoRaWAN dal config.h
-    // uint16_t FCntDown = 0;  // Frame counter downlink (TODO: incrementare per ogni TX)
-    
-    // // Costruisce pacchetto LoRaWAN downlink senza payload
-    // uint8_t lorawan_frame[32];
-    // uint8_t pos = 0;
-    
-    // // MHDR (1 byte): Downlink unconfirmed
-    // lorawan_frame[pos++] = 0x60;  // MType=001 (Unconfirmed Data Down)
-    
-    // // DevAddr (4 bytes) - little-endian
-    // lorawan_frame[pos++] = (devAddr) & 0xFF;
-    // lorawan_frame[pos++] = (devAddr >> 8) & 0xFF;
-    // lorawan_frame[pos++] = (devAddr >> 16) & 0xFF;
-    // lorawan_frame[pos++] = (devAddr >> 24) & 0xFF;
-    
-    // // FCtrl (1 byte): tutti i flag a 0
-    // lorawan_frame[pos++] = 0x00;
-    
-    // // FCnt (2 bytes): Frame counter - little-endian
-    // lorawan_frame[pos++] = (FCntDown) & 0xFF;
-    // lorawan_frame[pos++] = (FCntDown >> 8) & 0xFF;
-    
-    // // Ora calcoliamo il MIC su tutto il frame (senza MIC stesso)
-    // size_t frame_length_without_mic = pos;
-    
-    // // Calcola MIC con AES-CMAC (LoRaWAN 1.1 downlink)
-    // // Block B0 per MIC calculation (rinominato per evitare conflitto con macro Arduino)
-    // uint8_t blockB0[16];
-    // memset(blockB0, 0, 16);
-    // blockB0[0] = 0x49;  // 0x49 per downlink
-    // blockB0[1] = 0x00;  // ConfFCnt (4 bytes) - 0 per unconfirmed
-    // blockB0[2] = 0x00;
-    // blockB0[3] = 0x00;
-    // blockB0[4] = 0x00;
-    // blockB0[5] = 0x01;  // Direction: 1 = downlink
-    // blockB0[6] = (devAddr) & 0xFF;
-    // blockB0[7] = (devAddr >> 8) & 0xFF;
-    // blockB0[8] = (devAddr >> 16) & 0xFF;
-    // blockB0[9] = (devAddr >> 24) & 0xFF;
-    // blockB0[10] = (FCntDown) & 0xFF;
-    // blockB0[11] = (FCntDown >> 8) & 0xFF;
-    // blockB0[12] = 0x00;  // FCnt upper bytes
-    // blockB0[13] = 0x00;
-    // blockB0[14] = 0x00;
-    // blockB0[15] = frame_length_without_mic;
-    
-    // // Prepara buffer per CMAC: blockB0 + frame
-    // uint8_t cmac_buffer[16 + 32];
-    // memcpy(cmac_buffer, blockB0, 16);
-    // memcpy(cmac_buffer + 16, lorawan_frame, frame_length_without_mic);
-    
-    // // Calcola CMAC usando la chiave da config.h
-    // RadioLibAES128 aes;
-    // aes.init((uint8_t*)LORAWAN_SNWKSINTKEY);
-    // uint8_t fullMic[16];
-    // aes.generateCMAC(cmac_buffer, 16 + frame_length_without_mic, fullMic);
-    
-    // // LoRaWAN usa solo i primi 4 bytes del MIC
-    // lorawan_frame[pos++] = fullMic[0];
-    // lorawan_frame[pos++] = fullMic[1];
-    // lorawan_frame[pos++] = fullMic[2];
-    // lorawan_frame[pos++] = fullMic[3];
-    
-    // size_t length = pos;
-    
-    // Serial.println("\n[DOWNLINK] ===== PREPARAZIONE ACK LOCALE =====");
-    // Serial.printf("[DOWNLINK] LoRaWAN Frame: %d bytes\n", length);
-    // Serial.printf("[DOWNLINK] MIC calcolato: %02X%02X%02X%02X\n", 
-    //               fullMic[0], fullMic[1], fullMic[2], fullMic[3]);
-    // Serial.print("[DOWNLINK] Frame (HEX): ");
-    // for (size_t i = 0; i < length; i++) {
-    //     Serial.printf("%02X ", lorawan_frame[i]);
-    // }
-    // Serial.println();
-    
-    // // Usa transmitDownlink per inviare con timing corretto
-    // transmitDownlink(lorawan_frame, length, rxTimestamp);
 }
 
 
