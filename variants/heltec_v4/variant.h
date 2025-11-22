@@ -1,6 +1,7 @@
 #ifndef VARIANT_H
 #define VARIANT_H
 
+#define ARCH_ESP32
 // LED
 #define LED_PIN 35
 

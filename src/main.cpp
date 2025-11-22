@@ -25,6 +25,7 @@
 #include "variant.h"
 #include "common.h"
 #include "TypeDef.h"
+#include "power.h"
 
 // ===========================
 // OLED DISPLAY
@@ -59,6 +60,8 @@ uint32_t packetsForwarded = 0;
 unsigned long lastDisplayUpdate = 0;
 unsigned long lastNtpUpdate = 0;
 unsigned long lastPullData = 0;
+unsigned long lastPowerCheck = 0;
+unsigned long powerCheckInterval = 10000;
 bool radioInitialized = false;
 
 
@@ -120,6 +123,8 @@ DownlinkQueue dowQueue = DownlinkQueue();
 // SETUP
 // ===========================
 void setup() {
+
+  analogInit();
     // Initialize USB Serial
     Serial.begin(115200);
     
@@ -192,7 +197,15 @@ void processDownlinkQueue() {
 void loop() {
     // Handle OTA updates
     ArduinoOTA.handle();
-    
+
+    // Check power status periodically
+    if (millis() - lastPowerCheck > powerCheckInterval) {
+        uint16_t batteryVoltage = analogLevel.getBattVoltage();
+        Serial.printf("[POWER] Battery voltage: %d\n", batteryVoltage);
+        int batteryPercent = analogLevel.getBatteryPercent();
+        Serial.printf("[POWER] Battery percent: %d\n", batteryPercent);
+        lastPowerCheck = millis();
+    }
     // Send PULL_DATA to ChirpStack periodically (every 5 seconds)
     if (millis() - lastPullData > 5000) {
         sendPullData();
@@ -817,8 +830,9 @@ void sendUdpPacket(const char* jsonData) {
 
 void sendStatPacket() {
     if (!WiFi.isConnected()) return;
-    
+
     StaticJsonDocument<256> doc;
+    
     JsonObject stat = doc.createNestedObject("stat");
     
     // Get current time
