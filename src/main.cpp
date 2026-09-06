@@ -204,6 +204,12 @@ void loop() {
         Serial.printf("[POWER] Battery voltage: %d\n", batteryVoltage);
         int batteryPercent = analogLevel.getBatteryPercent();
         Serial.printf("[POWER] Battery percent: %d\n", batteryPercent);
+        bool isBatteryConnected = analogLevel.isBatteryConnect();
+        Serial.printf("[POWER] Battery connected: %s\n", isBatteryConnected ? "YES" : "NO");
+        bool isVbusIn = analogLevel.isVbusIn();
+        Serial.printf("[POWER] Vbus in: %s\n", isVbusIn ? "YES" : "NO");
+        bool isCharging = analogLevel.isCharging();
+        Serial.printf("[POWER] Charging: %s\n", isCharging ? "YES" : "NO");
         lastPowerCheck = millis();
     }
     // Send PULL_DATA to ChirpStack periodically (every 5 seconds)

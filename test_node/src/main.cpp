@@ -10,6 +10,7 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <RadioLib.h>
+#include "power.h"
 
 // ===========================
 // PINOUT - Heltec V4
@@ -195,6 +196,8 @@ size_t downlinkLen = 0;
 LoRaWANEvent_t downlinkEvent;
 LoRaWANEvent_t uplinkEvent;
 
+unsigned long lastPowerCheck = 0;
+unsigned long powerCheckInterval = 10000;
 // ===========================
 // SETUP
 // ===========================
@@ -484,6 +487,21 @@ void printDownlinkInfo() {
 // ===========================
 void loop() {
   unsigned long now = millis();
+
+   // Check power status periodically
+   if (millis() - lastPowerCheck > powerCheckInterval) {
+    uint16_t batteryVoltage = analogLevel.getBattVoltage();
+    Serial.printf("[POWER] Battery voltage: %d\n", batteryVoltage);
+    int batteryPercent = analogLevel.getBatteryPercent();
+    Serial.printf("[POWER] Battery percent: %d\n", batteryPercent);
+    bool isBatteryConnected = analogLevel.isBatteryConnect();
+    Serial.printf("[POWER] Battery connected: %s\n", isBatteryConnected ? "YES" : "NO");
+    bool isVbusIn = analogLevel.isVbusIn();
+    Serial.printf("[POWER] Vbus in: %s\n", isVbusIn ? "YES" : "NO");
+    bool isCharging = analogLevel.isCharging();
+    Serial.printf("[POWER] Charging: %s\n", isCharging ? "YES" : "NO");
+    lastPowerCheck = millis();
+}
 
   // Invia pacchetto ogni TRANSMISSION_INTERVAL
   if (lastTransmission == 0 ||

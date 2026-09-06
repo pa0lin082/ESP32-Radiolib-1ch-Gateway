@@ -397,4 +397,4 @@ For issues or questions:
 ---
 
 **Version**: 1.0.0  
-**Last update**: 2024
+**Last update**: 2025

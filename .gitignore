@@ -6,4 +6,6 @@
 .vscode/launch.json
 .vscode/ipch
 include/config.h
+packages/*
+platforms/*
 
