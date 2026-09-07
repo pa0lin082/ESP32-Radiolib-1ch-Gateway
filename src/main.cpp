@@ -61,8 +61,15 @@ unsigned long lastDisplayUpdate = 0;
 unsigned long lastNtpUpdate = 0;
 unsigned long lastPullData = 0;
 unsigned long lastPowerCheck = 0;
-unsigned long powerCheckInterval = 10000;
+unsigned long powerCheckInterval = 120000;
 bool radioInitialized = false;
+
+// Stato connessione al network server (ChirpStack), verificato tramite PULL_ACK
+unsigned long lastPullAck = 0;
+const unsigned long CS_LINK_TIMEOUT = 15000; // nessun ACK da 15s -> considerato offline (3x intervallo PULL_DATA)
+bool isCsOnline() {
+    return lastPullAck != 0 && (millis() - lastPullAck < CS_LINK_TIMEOUT);
+}
 
 
 // Interrupt flag for packet reception
@@ -80,7 +87,16 @@ uint32_t otherErrors = 0;
 // ===========================
 // INTERRUPT SERVICE ROUTINE
 // ===========================
+// Cattura il timestamp qui, non più avanti in handleLoRaPacket(): quello è il
+// vero istante (a livello hardware) in cui il pacchetto è arrivato. Catturarlo
+// dopo, nel loop principale, dopo Serial.print/printf e una transazione SPI
+// (radio.readData()), introduce un ritardo sistematico che si somma su ogni
+// pacchetto - piccolo in assoluto, ma sufficiente a far mancare consistentemente
+// la finestra RX1/RX2 della Join Accept quando il margine è di poche decine di ms.
+volatile unsigned long lastRxTimestamp = 0;
+
 void IRAM_ATTR setPacketReceivedFlag() {
+    lastRxTimestamp = millis();
     packetReceived = true;
 }
 
@@ -173,10 +189,14 @@ void setup() {
 void processDownlinkQueue() {
   PullRespPacket *pullRespPacket = dowQueue.findFirstImmediate();
   if (pullRespPacket) {
-    pullRespPacket->responseData.txpk.data;
-
+    // txpk.data is the *base64 text string* from the PULL_RESP JSON, never
+    // decoded - transmitting it directly (as this did before) sends the raw
+    // ASCII bytes of that string over the air instead of the actual binary
+    // LoRaWAN frame. decodedPayload/decodedLength (already base64-decoded by
+    // getPullResponse(), same as what the RX1/RX2 path in transmitDownlink()
+    // uses) is the correct buffer.
     radio.invertIQ(true);
-    int state = radio.transmit(pullRespPacket->responseData.txpk.data, pullRespPacket->responseData.txpk.size);
+    int state = radio.transmit(pullRespPacket->responseData.decodedPayload, pullRespPacket->responseData.decodedLength);
     radio.invertIQ(false);
     digitalWrite(LED_PIN, HIGH);
     justTransmitted = true;
@@ -191,6 +211,19 @@ void processDownlinkQueue() {
     }
   }
 }
+
+void powerCheck() {
+    uint16_t batteryVoltage = analogLevel.getBattVoltage();
+    Serial.printf("[POWER] Battery voltage: %d\n", batteryVoltage);
+    int batteryPercent = analogLevel.getBatteryPercent();
+    Serial.printf("[POWER] Battery percent: %d\n", batteryPercent);
+    bool isBatteryConnected = analogLevel.isBatteryConnect();
+    Serial.printf("[POWER] Battery connected: %s\n", isBatteryConnected ? "YES" : "NO");
+    bool isVbusIn = analogLevel.isVbusIn();
+    Serial.printf("[POWER] Vbus in: %s\n", isVbusIn ? "YES" : "NO");
+    bool isCharging = analogLevel.isCharging();
+    Serial.printf("[POWER] Charging: %s\n", isCharging ? "YES" : "NO");
+}
 // ===========================
 // MAIN LOOP
 // ===========================
@@ -200,16 +233,7 @@ void loop() {
 
     // Check power status periodically
     if (millis() - lastPowerCheck > powerCheckInterval) {
-        uint16_t batteryVoltage = analogLevel.getBattVoltage();
-        Serial.printf("[POWER] Battery voltage: %d\n", batteryVoltage);
-        int batteryPercent = analogLevel.getBatteryPercent();
-        Serial.printf("[POWER] Battery percent: %d\n", batteryPercent);
-        bool isBatteryConnected = analogLevel.isBatteryConnect();
-        Serial.printf("[POWER] Battery connected: %s\n", isBatteryConnected ? "YES" : "NO");
-        bool isVbusIn = analogLevel.isVbusIn();
-        Serial.printf("[POWER] Vbus in: %s\n", isVbusIn ? "YES" : "NO");
-        bool isCharging = analogLevel.isCharging();
-        Serial.printf("[POWER] Charging: %s\n", isCharging ? "YES" : "NO");
+        powerCheck();
         lastPowerCheck = millis();
     }
     // Send PULL_DATA to ChirpStack periodically (every 5 seconds)
@@ -302,9 +326,9 @@ void updateDisplay() {
     
     // WiFi status
     char line[32];
-    snprintf(line, sizeof(line), "WiFi: %s", WiFi.isConnected() ? "OK" : "DISC");
+    snprintf(line, sizeof(line), "WiFi:%s CS:%s", WiFi.isConnected() ? "OK" : "NO", isCsOnline() ? "OK" : "NO");
     display.drawStr(0, 22, line);
-    
+
     // Frequency and SF
     snprintf(line, sizeof(line), "%.1fMHz SF%d", LORA_FREQUENCY, LORA_SPREADING_FACTOR);
     display.drawStr(0, 34, line);
@@ -630,8 +654,11 @@ void handleLoRaPacket() {
     
     if (state == RADIOLIB_ERR_NONE) {
         // Packet received successfully
-        // Cattura il timestamp SUBITO per calcolo preciso finestre RX
-        unsigned long rxTimestamp = millis();
+        // Preso in setPacketReceivedFlag() (ISR), non qui: a questo punto sono
+        // già passati due Serial.print/printf e la SPI read sopra, che
+        // introducono un ritardo sistematico rispetto al vero istante di
+        // arrivo del pacchetto via radio.
+        unsigned long rxTimestamp = lastRxTimestamp;
         
         digitalWrite(LED_PIN, LOW);  // LED on
         
@@ -664,14 +691,39 @@ void handleLoRaPacket() {
         PullRespPacket *pullRespPacket = nullptr;
         LoRaWANHeader lorawanHeader;
         memcpy(&lorawanHeader, rxBuffer, sizeof(LoRaWANHeader));
+
+        // Per una Join Request (MType 0) lorawanHeader.devAddr non è un campo
+        // valido: a quella posizione nel frame c'è il JoinEUI, non un vero
+        // DevAddr - va tenuto a mente ovunque più sotto si ragiona su devAddr
+        // per questo uplink (ricerca in coda, controllo di sanità pre-invio).
+        uint8_t uplinkMType = (lorawanHeader.mhdr >> 5) & 0x07;
+        bool isJoinRequest = (uplinkMType == 0x00);
+
         Serial.printf("[RX] MHDR: 0x%02X\n", lorawanHeader.mhdr);
-        Serial.printf("[RX] DevAddr: 0x%08X\n", lorawanHeader.devAddr);
-        Serial.printf("[RX] FCtrl: 0x%02X\n", lorawanHeader.fctrl);
-        Serial.printf("[RX] FCnt: 0x%04X\n", lorawanHeader.fcnt);
-        Serial.printf("[RX] FOptsLen: %d\n", lorawanHeader.getFOptsLen());
-        Serial.printf("[RX] ACK: %s\n", lorawanHeader.getACK() ? "SI" : "NO");
-        Serial.printf("[RX] FPending: %s\n", lorawanHeader.getFPending() ? "SI" : "NO");
-        
+
+        if (isJoinRequest && packetLength >= 23) {
+            // Join Request: MHDR(1) | JoinEUI(8, LE) | DevEUI(8, LE) | DevNonce(2, LE) | MIC(4)
+            // DevAddr/FCtrl/FCnt non esistono in questo frame - non stamparli,
+            // sono fuorvianti (lorawanHeader li legge comunque, ma da byte che
+            // qui sono in realtà JoinEUI).
+            uint64_t joinEUI = 0, devEUI = 0;
+            for (int i = 7; i >= 0; i--) joinEUI = (joinEUI << 8) | rxBuffer[1 + i];
+            for (int i = 7; i >= 0; i--) devEUI = (devEUI << 8) | rxBuffer[9 + i];
+            uint16_t devNonce = rxBuffer[17] | (rxBuffer[18] << 8);
+
+            Serial.println("[RX] 🔑 JOIN REQUEST");
+            Serial.printf("[RX]   JoinEUI:  %016llX\n", joinEUI);
+            Serial.printf("[RX]   DevEUI:   %016llX\n", devEUI);
+            Serial.printf("[RX]   DevNonce: %u\n", devNonce);
+        } else {
+            Serial.printf("[RX] DevAddr: 0x%08X\n", lorawanHeader.devAddr);
+            Serial.printf("[RX] FCtrl: 0x%02X\n", lorawanHeader.fctrl);
+            Serial.printf("[RX] FCnt: 0x%04X\n", lorawanHeader.fcnt);
+            Serial.printf("[RX] FOptsLen: %d\n", lorawanHeader.getFOptsLen());
+            Serial.printf("[RX] ACK: %s\n", lorawanHeader.getACK() ? "SI" : "NO");
+            Serial.printf("[RX] FPending: %s\n", lorawanHeader.getFPending() ? "SI" : "NO");
+        }
+
         // Forward to ChirpStack
         if (WiFi.isConnected()) {
             // Create JSON packet
@@ -722,14 +774,22 @@ void handleLoRaPacket() {
             unsigned long waitTime = 700;
 
             bool pullRespReceived = false;
-            
-            Serial.printf("[GW] ⚡ Attesa PULL_RESP for addr: 0x%08X downlink to queue after uplink (%lu ms), max wait time: %lu ms\n", lorawanHeader.devAddr, millis() - waitStart, waitTime);
+
+            // isJoinRequest (dichiarata più sopra, dopo la decodifica di
+            // lorawanHeader): per una Join Request la Join Accept che
+            // arriverà in risposta è cifrata, quindi il suo "DevAddr" è solo
+            // rumore letto da byte cifrati - non corrisponderà mai a quello
+            // (altrettanto fasullo) letto dalla join-request. In quel caso
+            // peschiamo il primo downlink in coda invece di cercare un match.
+            Serial.printf("[GW] ⚡ Attesa PULL_RESP for addr: 0x%08X (join=%s) downlink to queue after uplink (%lu ms), max wait time: %lu ms\n",
+                          lorawanHeader.devAddr, isJoinRequest ? "yes" : "no", millis() - waitStart, waitTime);
             while (millis() - waitStart < waitTime) {  // Max 500ms di attesa (aumentato da 200ms)
                 handleUdpDownlink(); // Controlla continuamente se arriva
                                    // PULL_RESP
 
-                    
-                pullRespPacket = dowQueue.findFirstByDevAddr(lorawanHeader.devAddr);
+                pullRespPacket = isJoinRequest
+                                     ? dowQueue.findFirstPending()
+                                     : dowQueue.findFirstByDevAddr(lorawanHeader.devAddr);
                 if (pullRespPacket) {
                     pullRespReceived = true;
                     Serial.printf("[GW] ⚡ PULL_RESP ricevuto dopo uplink (%lu ms)\n", millis() - waitStart);
@@ -765,8 +825,13 @@ void handleLoRaPacket() {
         digitalWrite(LED_PIN, HIGH);  // LED off
         
         // Invia risposta "OK" al nodo se abilitato
+        // Per una Join Request lorawanHeader.devAddr è sempre 0 (non è un
+        // campo valido per quel tipo di frame, vedi findFirstPending() sopra)
+        // quindi lì il controllo va bypassato; per un downlink dati normale
+        // resta un controllo di sanità valido.
         #if AUTO_DOWNLINK_ENABLED
-        if (lorawanHeader.devAddr != 0 && pullRespPacket) {
+        bool devAddrOk = isJoinRequest || (lorawanHeader.devAddr != 0);
+        if (devAddrOk && pullRespPacket) {
           sendDownlinkResponse(rxTimestamp, pullRespPacket);
         } else {
             Serial.println("[DOWNLINK] DevAddr non valido o PULL_RESP non trovato, skip downlink");
@@ -922,6 +987,8 @@ void handleUdpDownlink() {
     }
 
     if (packet.getMessageType() == SemtechMessageType::PULL_ACK) {
+      lastPullAck = millis();
+    //   Serial.println("[handleUdpDownlink] PULL_ACK ricevuto - server CS raggiungibile");
       return;
     }else  if (packet.getMessageType() == SemtechMessageType::PULL_RESP) {
       PullResponseData responseData;
@@ -964,7 +1031,7 @@ bool transmitDownlink(uint8_t* data, size_t length, unsigned long rxTimestamp) {
         radio.startReceive();
         return false;
     }
-    
+
     Serial.println("\n[TX_DL] ===== TRASMISSIONE DOWNLINK =====");
     Serial.printf("[TX_DL] Lunghezza: %d bytes\n", length);
     Serial.print("[TX_DL] Frame (HEX): ");
@@ -972,17 +1039,27 @@ bool transmitDownlink(uint8_t* data, size_t length, unsigned long rxTimestamp) {
         Serial.printf("%02X ", data[i]);
     }
     Serial.println();
-    
+
+    // MHDR (primo byte, bit 7-5) dice se questo downlink è una Join Accept:
+    // in quel caso le finestre RX1/RX2 seguono il timing (più lungo) della
+    // join-accept, non quello dei downlink dati - vedi JOIN_ACCEPT_DELAY1/2.
+    uint8_t mtype = length > 0 ? (data[0] >> 5) & 0x07 : 0xFF;
+    bool isJoinAccept = (mtype == 0x01);
+    unsigned long rx1Delay = isJoinAccept ? JOIN_ACCEPT_DELAY1 : RX1_DELAY;
+    unsigned long rx2Delay = isJoinAccept ? JOIN_ACCEPT_DELAY2 : RX2_DELAY;
+    Serial.printf("[TX_DL] Tipo: %s (rx1=%lums, rx2=%lums)\n",
+                  isJoinAccept ? "Join Accept" : "Data downlink", rx1Delay, rx2Delay);
+
     // Calcola tempo trascorso dalla ricezione
     unsigned long elapsed = getElapsedTime(rxTimestamp);
     Serial.printf("[TX_DL] Tempo trascorso dalla RX: %lu ms\n", elapsed);
-    
+
     bool transmitted = false;
     int rxWindow = 0;
-    
+
     // ===== TENTATIVO RX1 =====
-    if (elapsed < RX1_DELAY) {
-        unsigned long waitTime = RX1_DELAY - elapsed;
+    if (elapsed < rx1Delay) {
+        unsigned long waitTime = rx1Delay - elapsed;
         Serial.printf("[TX_DL] Attendo %lu ms per finestra RX1...\n", waitTime);
         delay(waitTime);
         
@@ -1021,9 +1098,9 @@ bool transmitDownlink(uint8_t* data, size_t length, unsigned long rxTimestamp) {
     // ===== TENTATIVO RX2 (solo per debug, normalmente skip se RX1 OK) =====
     if (!transmitted) {
         elapsed = getElapsedTime(rxTimestamp);
-        
-        if (elapsed < RX2_DELAY) {
-            unsigned long waitTime = RX2_DELAY - elapsed;
+
+        if (elapsed < rx2Delay) {
+            unsigned long waitTime = rx2Delay - elapsed;
             Serial.printf("[TX_DL] Attendo %lu ms per finestra RX2...\n", waitTime);
             delay(waitTime);
             

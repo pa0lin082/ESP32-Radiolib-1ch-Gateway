@@ -555,6 +555,23 @@ public:
         }
         return nullptr;
     }
+
+    // Trova il primo elemento valido, senza filtrare per DevAddr.
+    // Serve per le Join Accept: il loro payload è cifrato, quindi il "DevAddr"
+    // letto dal gateway (sia sulla join-request in uplink che sul downlink in
+    // coda) è solo un valore casuale estratto da byte cifrati - non correla
+    // mai tra uplink e downlink, quindi findFirstByDevAddr() non può funzionare
+    // in questo caso. Va bene assumere "il primo in coda" perché in un
+    // gateway single-channel di test c'è tipicamente un solo nodo alla volta
+    // in fase di join.
+    PullRespPacket* findFirstPending() {
+        for (uint8_t i = 0; i < MAX_DOWNLINK_QUEUE_SIZE; i++) {
+            if (queue[i].isValid()) {
+                return &queue[i];
+            }
+        }
+        return nullptr;
+    }
     
     // Conta quanti elementi ci sono per un specifico DevAddr
     uint8_t countByDevAddr(uint32_t devAddr) const {
