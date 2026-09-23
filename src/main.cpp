@@ -599,8 +599,9 @@ void initLoRa() {
     radio.setDio1Action(setPacketReceivedFlag);
     Serial.println("[LORA] Interrupt configured on DIO1");
     
-    state = radio.setCurrentLimit(140);
-    Serial.printf("[RadioLib] Current limit set to %f\n", 140);
+    const float currentLimit = 140.0f;
+    state = radio.setCurrentLimit(currentLimit);
+    Serial.printf("[RadioLib] Current limit set to %.1f mA\n", currentLimit);
     Serial.printf("[RadioLib] Current limit set result %d\n", state);
     
     // Riepilogo configurazione
@@ -990,6 +991,10 @@ void handleUdpDownlink() {
     if (packet.getMessageType() == SemtechMessageType::PULL_ACK) {
       lastPullAck = millis();
     //   Serial.println("[handleUdpDownlink] PULL_ACK ricevuto - server CS raggiungibile");
+      return;
+    }else if (packet.getMessageType() == SemtechMessageType::PUSH_ACK) {
+      // Conferma che il PUSH_DATA (stat o uplink) e' arrivato al server.
+      // Per specifica e' lungo 4 byte e non ha payload: non c'e' nulla da fare.
       return;
     }else  if (packet.getMessageType() == SemtechMessageType::PULL_RESP) {
       PullResponseData responseData;
