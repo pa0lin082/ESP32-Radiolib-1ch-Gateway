@@ -86,6 +86,13 @@ const float EU868_FREQS[] = {
 #define WIFI_CONNECT_TIMEOUT 30000  // ms
 #define NTP_UPDATE_INTERVAL 3600000 // ms (1 hour)
 
+// Intervallo di invio dei frame "stat" (PUSH_DATA) verso ChirpStack.
+// DEVE combaciare con lo "Stats interval (secs)" configurato sul gateway in
+// ChirpStack: lo stato online/offline e' calcolato SOLO da questi frame, e
+// ChirpStack considera il gateway offline dopo stats_interval_secs * 2.
+// Con 30 s qui e 30 s in ChirpStack si va offline solo dopo 60 s di silenzio.
+#define STAT_INTERVAL 30000 // ms (30 s)
+
 // ===========================
 // NTP CONFIGURATION
 // ===========================

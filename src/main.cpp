@@ -265,9 +265,10 @@ void loop() {
         lastNtpUpdate = millis();
     }
     
-    // Send statistics every 300 seconds
+    // Send statistics (vedi STAT_INTERVAL in config.h: deve combaciare con lo
+    // "Stats interval" del gateway in ChirpStack, che da' per offline dopo 2x)
     static unsigned long lastStatTime = 0;
-    if (lastStatTime == 0 || millis() - lastStatTime > 300000) {
+    if (lastStatTime == 0 || millis() - lastStatTime > STAT_INTERVAL) {
         sendStatPacket();
         lastStatTime = millis();
     }
