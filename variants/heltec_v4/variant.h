@@ -42,6 +42,17 @@
 #define SX126X_DIO2_AS_RF_SWITCH
 #define SX126X_DIO3_TCXO_VOLTAGE 1.8
 
+// Front-end esterno GC1109 (PA + LNA + commutatore T/R) della Heltec V4.
+// Senza pilotarlo l'antenna resta separata dalla radio da un commutatore non
+// alimentato: attenua in ENTRAMBE le direzioni senza alcun errore software.
+// Pin presi dal variant Meshtastic della stessa scheda (USE_GC1109_PA).
+//   LORA_PA_POWER  alimenta il modulo, sempre HIGH
+//   LORA_PA_EN     abilita il front-end
+//   LORA_PA_TX_EN  sceglie il ramo: HIGH = TX, LOW = RX
+#define LORA_PA_POWER 7
+#define LORA_PA_EN 2
+#define LORA_PA_TX_EN 46
+
 
 #define DISPLAY_ENABLED true
 #endif // VARIANT_H

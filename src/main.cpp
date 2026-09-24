@@ -43,6 +43,17 @@ U8G2_SSD1306_128X64_NONAME_F_HW_I2C display(U8G2_R0, /* reset=*/ RESET_OLED);
 SPIClass loraSPI(HSPI);
 SX1262 radio = new Module(LORA_CS, LORA_DIO1, LORA_RESET, LORA_DIO2, loraSPI);
 
+#if defined(LORA_PA_EN)
+// RadioLib commuta questi pin da solo a ogni passaggio TX/RX.
+static const uint32_t rfswitch_pins[] = {LORA_PA_EN, LORA_PA_TX_EN, RADIOLIB_NC, RADIOLIB_NC, RADIOLIB_NC};
+static const Module::RfSwitchMode_t rfswitch_table[] = {
+    {Module::MODE_IDLE, {LOW, LOW}},
+    {Module::MODE_RX, {HIGH, LOW}},
+    {Module::MODE_TX, {HIGH, HIGH}},
+    END_OF_MODE_TABLE,
+};
+#endif
+
 // ===========================
 // NETWORK CONFIGURATION
 // ===========================
@@ -127,8 +138,15 @@ void sendStatPacket();
 void sendPullData();
 void handleUdpDownlink();
 void sendDownlinkResponse(unsigned long rxTimestamp, PullRespPacket *pullRespPacket);
-bool transmitDownlink(uint8_t* data, size_t length, unsigned long rxTimestamp);
-void sendTxAck(uint16_t token);
+// txError (opzionale): su fallimento riceve il valore TxAckStatus da mettere
+// nel TX_ACK ("TOO_LATE" se le finestre sono scadute, "INTERNAL_ERROR" se e'
+// la radio ad aver fallito). Resta nullptr in caso di successo.
+bool transmitDownlink(uint8_t* data, size_t length, unsigned long rxTimestamp,
+                      const char** txError = nullptr);
+// error (opzionale): se non nullptr aggiunge il JSON {"txpk_ack":{"error":...}}.
+// DEVE essere un membro dell'enum TxAckStatus di ChirpStack, altrimenti il
+// gateway-bridge scarta l'intero TX_ACK ("unexpected error: ...").
+void sendTxAck(uint16_t token, const char* error = nullptr);
 void decodeLoRaWANPacket(uint8_t *data, size_t length);
 
 
@@ -207,7 +225,13 @@ void processDownlinkQueue() {
       dowQueue.remove(pullRespPacket);
       stats.tx_emitted++;
     } else {
-      Serial.println("[PULL] ❌ Errore trasmissione messaggio Classe C");
+      Serial.printf("[PULL] ❌ Errore trasmissione messaggio Classe C: %d\n", state);
+      sendTxAck(pullRespPacket->token, "INTERNAL_ERROR");
+
+      // Rimuovere sempre: processDownlinkQueue() gira ad ogni iterazione del
+      // loop e radio.transmit() e' bloccante, quindi un elemento lasciato in
+      // coda verrebbe ritentato all'infinito bloccando RX LoRa, UDP e stat.
+      dowQueue.remove(pullRespPacket);
     }
   }
 }
@@ -543,16 +567,32 @@ void initLoRa() {
     #endif
     
     // Initialize SPI for LoRa
+
+#if defined(LORA_PA_POWER)
+    pinMode(LORA_PA_POWER, OUTPUT);
+    digitalWrite(LORA_PA_POWER, HIGH);
+    Serial.printf("[LORA] PA esterno alimentato (pin %d)\n", LORA_PA_POWER);
+    radio.setRfSwitchTable(rfswitch_pins, rfswitch_table);
+    Serial.println("[LORA] setRfSwitchTable (GC1109) configurata");
+#endif
+
     loraSPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
     
     // Initialize radio
+    // L'ottavo argomento e' la tensione del TCXO, ed e' il motivo per cui va
+    // passato esplicitamente: il default di RadioLib e' 1.6 V, ma il TCXO
+    // delle Heltec (alimentato dal DIO3 della radio) vuole 1.8 V - come gia'
+    // dichiarava variant.h con SX126X_DIO3_TCXO_VOLTAGE, define che pero'
+    // nessuno leggeva. Sottoalimentato, il TCXO oscilla fuori specifica e
+    // l'errore di frequenza che ne deriva si paga tutto in sensibilita'.
     int state = radio.begin(LORA_FREQUENCY, 
                            LORA_BANDWIDTH, 
                            LORA_SPREADING_FACTOR, 
                            LORA_CODING_RATE, 
                            LORA_SYNC_WORD, 
                            LORA_OUTPUT_POWER, 
-                           LORA_PREAMBLE_LENGTH);
+                           LORA_PREAMBLE_LENGTH,
+                           SX126X_DIO3_TCXO_VOLTAGE);
     
     if (state == RADIOLIB_ERR_NONE) {
         Serial.println("[LORA] SX1262 initialized successfully!");
@@ -603,6 +643,12 @@ void initLoRa() {
     state = radio.setCurrentLimit(currentLimit);
     Serial.printf("[RadioLib] Current limit set to %.1f mA\n", currentLimit);
     Serial.printf("[RadioLib] Current limit set result %d\n", state);
+
+    // Guadagno maggiorato in ricezione: qualche mA in piu' per 2-3 dB di
+    // sensibilita'. Su un gateway, che sta sempre in ascolto, e' il posto dove
+    // rendono di piu'.
+    state = radio.setRxBoostedGainMode(true);
+    Serial.printf("[RadioLib] RX boosted gain -> %d\n", state);
     
     // Riepilogo configurazione
     Serial.println("\n[LORA] ===== CONFIGURAZIONE RADIO =====");
@@ -1031,9 +1077,13 @@ unsigned long getElapsedTime(unsigned long referenceMillis) {
 // TRASMISSIONE DOWNLINK
 // Ritorna true se la trasmissione è riuscita, false altrimenti
 // ===========================
-bool transmitDownlink(uint8_t* data, size_t length, unsigned long rxTimestamp) {
+bool transmitDownlink(uint8_t* data, size_t length, unsigned long rxTimestamp,
+                      const char** txError) {
+    if (txError) *txError = nullptr;
+
     if (!radioInitialized) {
         Serial.println("[TX_DL] Radio non inizializzata");
+        if (txError) *txError = "INTERNAL_ERROR";
         radio.startReceive();
         return false;
     }
@@ -1094,11 +1144,13 @@ bool transmitDownlink(uint8_t* data, size_t length, unsigned long rxTimestamp) {
             rxWindow = 1;
         } else {
             Serial.printf("[TX_DL] ❌ Errore RX1: %d\n", state);
+            if (txError) *txError = "INTERNAL_ERROR";
         }
-        
+
         digitalWrite(LED_PIN, HIGH);
     } else {
         Serial.printf("[TX_DL] ⚠️ RX1 persa (elapsed: %lu ms)\n", elapsed);
+        if (txError) *txError = "TOO_LATE";
     }
     
     // ===== TENTATIVO RX2 (solo per debug, normalmente skip se RX1 OK) =====
@@ -1131,16 +1183,20 @@ bool transmitDownlink(uint8_t* data, size_t length, unsigned long rxTimestamp) {
                 rxWindow = 2;
             } else {
                 Serial.printf("[TX_DL] ❌ Errore RX2: %d\n", state);
+                if (txError) *txError = "INTERNAL_ERROR";
             }
-            
+
             digitalWrite(LED_PIN, HIGH);
         } else {
             Serial.printf("[TX_DL] ❌ RX2 persa (elapsed: %lu ms)\n", elapsed);
+            if (txError) *txError = "TOO_LATE";
         }
     }
     
     // ===== RIEPILOGO =====
     if (transmitted) {
+        // RX1 puo' aver gia' scritto "TOO_LATE" prima che RX2 riuscisse
+        if (txError) *txError = nullptr;
         Serial.printf("[TX_DL] ✅ Successo! Finestra: RX%d\n", rxWindow);
     } else {
         Serial.println("[TX_DL] ❌ FALLITO: Nessuna finestra disponibile");
@@ -1281,13 +1337,14 @@ void decodeLoRaWANPacket(uint8_t* data, size_t length) {
 // ===========================
 // TX_ACK - Conferma trasmissione downlink a ChirpStack
 // ===========================
-void sendTxAck(uint16_t token) {
+void sendTxAck(uint16_t token, const char* error) {
     if (!WiFi.isConnected()) {
         Serial.println("[TX_ACK] WiFi non connesso, skip TX_ACK");
         return;
     }
-    
-    Serial.printf("[TX_ACK] Invio TX_ACK con token 0x%04X\n", token);
+
+    Serial.printf("[TX_ACK] Invio TX_ACK con token 0x%04X (error: %s)\n",
+                  token, error ? error : "nessuno");
     
     udpClient.beginPacket(serverIP, SERVER_PORT);
     
@@ -1305,9 +1362,19 @@ void sendTxAck(uint16_t token) {
     for (int i = 7; i >= 0; i--) {
         udpClient.write((uint8_t)((gatewayId >> (i * 8)) & 0xFF));
     }
-    
+
+    // JSON txpk_ack: opzionale, assente = nessun errore (PROTOCOL.TXT sez. 6).
+    // Il gateway-bridge lo parsa solo se il pacchetto supera i 13 byte.
+    if (error != nullptr) {
+        char json[64];
+        int n = snprintf(json, sizeof(json), "{\"txpk_ack\":{\"error\":\"%s\"}}", error);
+        if (n > 0 && n < (int)sizeof(json)) {
+            udpClient.write((const uint8_t*)json, n);
+        }
+    }
+
     int result = udpClient.endPacket();
-    
+
     if (result) {
         Serial.println("[TX_ACK] ✅ TX_ACK inviato con successo");
     } else {
@@ -1331,20 +1398,31 @@ void sendDownlinkResponse(unsigned long rxTimestamp, PullRespPacket *pullRespPac
         // Trasmetti il primo messaggio in RX1
         // PendingDownlink* dl1 = &downlinkQueue[indices[0]];
         Serial.println("[DOWNLINK] 📤 Trasmissione messaggio 1 in RX1...");
+        const char* txError = nullptr;
         bool tx1Success = transmitDownlink(
             pullRespPacket->responseData.decodedPayload,  // Dati binari decodificati (non base64!)
             pullRespPacket->responseData.decodedLength,    // Lunghezza corretta
-            rxTimestamp
+            rxTimestamp,
+            &txError
         );
-        
+
         if (tx1Success) {
             Serial.println("[DOWNLINK] ✅ Messaggio 1 trasmesso con successo, invio TX_ACK");
             sendTxAck(pullRespPacket->token);
 
             dowQueue.remove(pullRespPacket);
-            
+
         } else {
-            Serial.println("[DOWNLINK] ❌ Trasmissione messaggio 1 fallita, NON invio TX_ACK");
+            // Il TX_ACK di errore va mandato comunque: senza, ChirpStack non sa
+            // che il downlink e' andato perso e non prova l'opzione successiva.
+            const char* err = txError ? txError : "INTERNAL_ERROR";
+            Serial.printf("[DOWNLINK] ❌ Trasmissione messaggio 1 fallita (%s), invio TX_ACK di errore\n", err);
+            sendTxAck(pullRespPacket->token, err);
+
+            // Rimuovere sempre: ritentare e' compito di ChirpStack, non del
+            // gateway. Lasciandolo in coda si satura MAX_DOWNLINK_PER_DEVADDR
+            // e ogni downlink futuro di questo device verrebbe rifiutato.
+            dowQueue.remove(pullRespPacket);
         }
         
         // Reset compatibilità

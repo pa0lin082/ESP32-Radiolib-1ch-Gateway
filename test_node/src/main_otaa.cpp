@@ -154,6 +154,17 @@ const LoRaWANBand_t EU868_SINGLE_CHANNEL = {
 // ===========================
 SPIClass loraSPI(HSPI);
 SX1262 radio = new Module(LORA_CS, LORA_DIO1, LORA_RESET, LORA_DIO2, loraSPI);
+
+#if defined(LORA_PA_EN)
+// RadioLib commuta questi pin da solo a ogni passaggio TX/RX.
+static const uint32_t rfswitch_pins[] = {LORA_PA_EN, LORA_PA_TX_EN, RADIOLIB_NC, RADIOLIB_NC, RADIOLIB_NC};
+static const Module::RfSwitchMode_t rfswitch_table[] = {
+    {Module::MODE_IDLE, {LOW, LOW}},
+    {Module::MODE_RX, {HIGH, LOW}},
+    {Module::MODE_TX, {HIGH, HIGH}},
+    END_OF_MODE_TABLE,
+};
+#endif
 LoRaWANNode node(&radio, &EU868_SINGLE_CHANNEL, 1);
 
 uint16_t frameCounter = 0;
@@ -273,6 +284,12 @@ void printDownlinkInfo() {
   } else {
     Serial.println("[RX] ⚠️ ATTENZIONE: Downlink ricevuto ma payload length è 0!");
   }
+  // RSSI/SNR del DOWNLINK, cioe' del segnale del gateway misurato QUI.
+  // Serve a separare le due direzioni: l'RSSI che vediamo nei log del gateway
+  // dipende da (TX del nodo + RX del gateway), questo da (TX del gateway + RX
+  // del nodo). Se sono entrambi pessimi il difetto e' simmetrico - tipico di
+  // due antenne scollegate; se uno solo lo e', il colpevole e' su quel lato.
+  Serial.printf("[RX] >>> DOWNLINK RSSI: %.2f dBm, SNR: %.2f dB <<<\n", radio.getRSSI(), radio.getSNR());
   Serial.printf("[RX] Downlink require ACK: %s\n", downlinkEvent.confirmed ? "Yes" : "No");
   Serial.printf("[RX] Downlink fPort: %d\n", downlinkEvent.fPort);
   Serial.printf("[RX] Downlink length: %zu bytes\n", downlinkLen);
@@ -299,12 +316,34 @@ void setup() {
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, HIGH);
 
+  // Vext alimenta, oltre all'OLED, lo stadio d'antenna LoRa della scheda -
+  // lo dice variant.h stesso ("powers the oled display and the lora antenna
+  // boost"). E' attivo BASSO. Senza, la radio trasmette comunque ma con lo
+  // stadio finale non alimentato, quindi pochissima potenza irradiata: un
+  // guasto che non produce alcun errore software.
+  //
+  // Il GATEWAY lo accendeva gia', ma dentro initDisplay(): qui non c'e'
+  // display, e nessuno lo aveva mai acceso. Meshtastic lo fa in setup()
+  // (src/main.cpp:462) proprio per questo.
+  pinMode(VEXT_ENABLE, OUTPUT);
+  digitalWrite(VEXT_ENABLE, LOW);
+  delay(10);
+
+
+#if defined(LORA_PA_POWER)
+  pinMode(LORA_PA_POWER, OUTPUT);
+  digitalWrite(LORA_PA_POWER, HIGH);
+  Serial.printf("[LORA] PA esterno alimentato (pin %d)\n", LORA_PA_POWER);
+  radio.setRfSwitchTable(rfswitch_pins, rfswitch_table);
+  Serial.println("[LORA] setRfSwitchTable (GC1109) configurata");
+#endif
+
   loraSPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
 
   Serial.println("[LORA] Inizializzazione SX1262...");
   int state = radio.begin(LORA_FREQUENCY, LORA_BANDWIDTH, LORA_SPREADING_FACTOR,
                           LORA_CODING_RATE, LORA_SYNC_WORD, LORA_OUTPUT_POWER,
-                          LORA_PREAMBLE_LENGTH);
+                          LORA_PREAMBLE_LENGTH, SX126X_DIO3_TCXO_VOLTAGE);
 
   if (state == RADIOLIB_ERR_NONE) {
     Serial.println("[LORA] OK!");
