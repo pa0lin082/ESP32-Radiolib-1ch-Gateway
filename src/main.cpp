@@ -82,6 +82,19 @@ bool isCsOnline() {
     return lastPullAck != 0 && (millis() - lastPullAck < CS_LINK_TIMEOUT);
 }
 
+// SERVER_HOST si risolve di nuovo dal loop, non solo all'avvio: il gateway e'
+// alimentato dal Pi e riparte con lui, ma e' pronto ben prima che l'mDNS del Pi
+// risponda, quindi la risoluzione in setup() fallisce e serverIP restava
+// 0.0.0.0 per sempre (PULL_DATA in broadcast, gateway offline in ChirpStack).
+// Serve anche se l'IP del server cambia (il Pi pubblica sia .100 che .110).
+const unsigned long RESOLVE_RETRY_INTERVAL = 10000;  // senza indirizzo: riprova ogni 10s
+const unsigned long RESOLVE_STALE_TIMEOUT = 60000;   // nessun PULL_ACK da 60s: risolve di nuovo
+unsigned long lastResolveAttempt = 0;
+
+bool hasServerIP() {
+    return serverIP != IPAddress((uint32_t)0);
+}
+
 
 // Interrupt flag for packet reception
 volatile bool packetReceived = false;
@@ -129,6 +142,8 @@ struct Statistics {
 void initDisplay();
 void updateDisplay();
 void initWiFi();
+bool resolveServer();
+void maintainServerIP();
 void initOTA();
 void initLoRa();
 void initNTP();
@@ -260,6 +275,8 @@ void loop() {
         powerCheck();
         lastPowerCheck = millis();
     }
+    maintainServerIP();
+
     // Send PULL_DATA to ChirpStack periodically (every 5 seconds)
     if (millis() - lastPullData > 5000) {
         sendPullData();
@@ -412,12 +429,40 @@ void initWiFi() {
     Serial.print("[WIFI] MAC address: ");
     Serial.println(WiFi.macAddress());
     
-    // Resolve server hostname
-    if (WiFi.hostByName(SERVER_HOST, serverIP)) {
-        Serial.print("[SERVER] Resolved to: ");
-        Serial.println(serverIP);
-    } else {
-        Serial.println("[SERVER] ERROR: Could not resolve hostname");
+    // Se fallisce (tipico: il Pi sta ancora avviandosi) ci riprova maintainServerIP()
+    resolveServer();
+}
+
+// Risolve SERVER_HOST in un IP temporaneo: se fallisce, serverIP resta com'era
+// invece di finire a 0.0.0.0
+bool resolveServer() {
+    lastResolveAttempt = millis();
+    IPAddress resolved;
+    if (WiFi.hostByName(SERVER_HOST, resolved) && resolved != IPAddress((uint32_t)0)) {
+        if (resolved != serverIP) {
+            Serial.print("[SERVER] Resolved to: ");
+            Serial.println(resolved);
+        }
+        serverIP = resolved;
+        return true;
+    }
+    Serial.printf("[SERVER] ERROR: Could not resolve %s (keeping %s)\n",
+                  SERVER_HOST, serverIP.toString().c_str());
+    return false;
+}
+
+void maintainServerIP() {
+    if (!WiFi.isConnected()) return;
+    unsigned long sinceAttempt = millis() - lastResolveAttempt;
+    if (!hasServerIP()) {
+        if (sinceAttempt > RESOLVE_RETRY_INTERVAL) resolveServer();
+        return;
+    }
+    // Indirizzo presente ma ChirpStack muto: magari e' cambiato l'IP del Pi
+    unsigned long sinceAck = millis() - lastPullAck;
+    if (sinceAck > RESOLVE_STALE_TIMEOUT && sinceAttempt > RESOLVE_STALE_TIMEOUT) {
+        Serial.println("[SERVER] No PULL_ACK for 60s, re-resolving server");
+        resolveServer();
     }
 }
 
@@ -916,7 +961,11 @@ void sendUdpPacket(const char* jsonData) {
         Serial.println("[UDP] ERROR: WiFi not connected");
         return;
     }
-    
+    if (!hasServerIP()) {
+        Serial.println("[UDP] ERROR: server not resolved yet");
+        return;
+    }
+
     udpClient.beginPacket(serverIP, SERVER_PORT);
     
     // Protocol version (always 0x02)
